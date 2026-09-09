@@ -1,0 +1,2 @@
+{"rom_format":{"mapper":0,"prg_banks":2,"chr_rom_banks":1,"chr_ram":false},
+ "assets":{"pattern_tables":[{"id":"font_tiles","source":"chr","bank":0,"offset":"0x0000","tile_count":256,"description":"font"}],"palettes":[],"tilemaps":[],"audio":[],"level_data":[]},"decoders":[]}

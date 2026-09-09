@@ -1,0 +1,544 @@
+# Genesis Reader — Clean Room A
+#
+# Reads a NES ROM and produces a BEHAVIORAL specification plus an asset manifest.
+# This is the only agent that ever touches ROM bytes. The model has no raw
+# shell: every ROM query goes through the typed rom_* tools in tools/, each of
+# which runs a fixed `nesrom` command on the fixed path rom/game.nes. The run
+# journal is therefore an exact record of every byte the analysis looked at.
+#
+# The spec that leaves this run is checked by validators/spec.rhai (barrier
+# lint: no addresses, no mnemonics, no opcode bytes) and again by
+# scripts/handoff.sh before anything reaches Clean Room B.
+
+[agent]
+name = "genesis-reader"
+version = "0.1.0"
+description = "Clean Room A: NES ROM → behavioral spec + asset manifest (no raw shell; ROM access only via typed tools)"
+entry_stage = "cartography"
+
+[tool_permissions]
+read_file  = "allow"
+read_files = "allow"
+list_dir   = "allow"
+write_file = "allow"
+edit_file  = "allow"
+shell      = "deny"
+bash       = "deny"
+web_search = "deny"
+web_fetch  = "deny"
+
+# Script tools may shell out (that is how rom_* reach nesrom) even though the
+# model itself cannot. Requires `[tool_script_permissions] shell = "allow"` in
+# ~/.leviath/config.toml — scripts/setup.sh sets it.
+[tool_script_permissions]
+shell = "allow"
+
+[compaction]
+provider = "openrouter"
+model = "openai/gpt-5.6-luna"
+
+# ─── Context layout ──────────────────────────────────────────────────────────
+[context.regions]
+task               = { kind = "pinned", budget = "2%", max_tokens = 3000, seed = "task", required = true, required_message = "Give the game a short name via --task (used for file names and the spec title)." }
+hardware_reference = { kind = "pinned", budget = "12%", max_tokens = 24000, seed = { files = ["reference/hardware_reference.md"] }, volatility = "stable", description = "NES hardware and mapper behavior, by role" }
+rom_structure      = { kind = "pinned", budget = "4%", max_tokens = 6000, required = true, required_message = "Write the ROM structure summary into `rom_structure` (context_write) before leaving cartography.", description = "Header, bank layout, vectors, CHR mode" }
+functions          = { kind = "hashmap", max_entries = 400, budget = "22%", max_tokens = 60000, volatility = "grows", description = "Catalog of routines keyed bank:addr — behavior, inputs, outputs, callers" }
+data_tables        = { kind = "hashmap", max_entries = 150, budget = "8%", max_tokens = 20000, volatility = "grows", description = "Data regions keyed bank:start — format, size, purpose" }
+hardware_map       = { kind = "pinned", budget = "4%", max_tokens = 8000, description = "Which subsystems drive PPU/APU/input, frame timing, split-screen tricks" }
+sound_engine       = { kind = "pinned", budget = "5%", max_tokens = 10000, description = "Sound driver behavior and sequence data grammar" }
+compression        = { kind = "pinned", budget = "3%", max_tokens = 6000, description = "Runtime data formats / compression schemes identified" }
+data_jobs          = { kind = "pinned", budget = "5%", max_tokens = 9000, seed = { files = ["reference/data_jobs.md"] }, volatility = "stable", description = "The data-stage jobs (A, A1, A2, A2b, A2c, A3, A4, B, C0, C) in full" }
+progress           = { kind = "hashmap", max_entries = 40, budget = "4%", max_tokens = 8000, volatility = "grows", description = "Per-job progress notes from the data stage (what is established, what is missing)" }
+todos               = { kind = "checklist", budget = "4%", max_tokens = 8000, description = "Entry points and ranges still to analyze" }
+trace              = { kind = "clearable", budget = "12%", max_tokens = 16000, description = "Current disassembly / xref output" }
+conversation       = { kind = "sliding_window", max_items = 30, budget = "14%", max_tokens = 20000, strategy = "bulk", overflow = 15 }
+scratch            = { kind = "clearable", budget = "5%", max_tokens = 8000 }
+
+# ─── Stage 1: Cartography ────────────────────────────────────────────────────
+[stages.cartography]
+mode = "autonomous"
+description = "Parse the header, map banks and vectors, survey CHR and APU use"
+model = { models = ["openai/gpt-5.6-luna"] }
+available_tools = ["rom_header", "rom_chr", "rom_apu", "rom_reach", "rom_observe", "write_file", "context_write", "context_read"]
+max_iterations = 12
+max_revisits = 2
+system_prompt = """
+You are the cartographer of a clean-room reverse-engineering pipeline. Your job is
+to map the ROM's STRUCTURE, not its logic.
+
+1. Call rom_header. Note mapper, PRG/CHR sizes, CHR-RAM vs CHR-ROM, mirroring,
+   and the bank window layout (which window is fixed, which are switchable, how
+   many banks). If `supported` is false, still continue but say so.
+2. Call rom_chr (with from_prg=true if the ROM has no CHR-ROM). Note how many
+   pattern tables / candidate tile sources exist and which look blank.
+3. Call rom_apu once to learn whether a sound engine exists and where it lives.
+3b. Call rom_observe (frames=120) once and note what the first screen shows
+   (title text, colours, sprites) — a one-line description in `rom_structure`.
+4. Call rom_reach once with no arguments for a first sketch: how many
+   subroutines, how much of the ROM is reachable from the vectors, and how many
+   bank-switch sites are "dynamic".
+
+Write ONE concise summary (under 60 lines) into the `rom_structure` region with
+context_write. It must include: mapper + name, bank sizes and counts, which bank
+holds the vectors (the fixed bank), a list of switchable banks by index, CHR mode,
+vector addresses, counts from rom_reach, and the sound-engine location guess.
+Also save the raw rom_header JSON to analysis/header.json with write_file.
+
+Do not describe game logic here. Then say you are done.
+"""
+[stages.cartography.tool_routing]
+default_region = "conversation"
+[stages.cartography.tool_routing.overrides]
+rom_reach = { region = "trace", max_result_tokens = 12000 }
+rom_chr   = { region = "trace", max_result_tokens = 4000 }
+rom_apu   = { region = "trace", max_result_tokens = 6000 }
+rom_observe = { region = "trace", max_result_tokens = 4000 }
+
+[stages.cartography.transitions.excavate_fixed]
+hint = "ROM structure is mapped"
+transform = "direct"
+gate = { require_regions = ["rom_structure"] }
+
+[stages.cartography.transitions.recover]
+condition = "error"
+
+# ─── Stage 2: Excavate the fixed bank (plan → read ⇄ write loop) ─────────────
+# The read stage has only ROM tools and a hard 2-iteration cap; the write stage
+# has only catalog tools and cannot be left until `functions` gained entries.
+# The structure, not the prompt, guarantees that every read is written up.
+[stages.excavate_fixed]
+mode = "autonomous"
+description = "Map the always-mapped code and queue every routine"
+model = { models = ["anthropic/claude-fable-5.1", "anthropic/claude-opus-5", "openai/gpt-5.6-sol"] }
+available_tools = ["rom_reach", "rom_disasm", "context_write", "todo_add"]
+max_iterations = 6
+system_prompt = """
+You are starting the excavation of the code that is always mapped (NROM /
+CNROM: the whole ROM; banked mappers: the fixed bank named in `rom_structure`).
+
+1. Call rom_reach (no arguments).
+2. In the next turn call todo_add (region "todos") once per subroutine it
+   listed, item text "$XXXX <kind> insns=N callers=[...]". Do them all in one
+   turn. Mark obvious generic runtime helpers (tiny leaf routines with many
+   callers, arithmetic, copy loops) with the suffix " [helper]".
+3. Write `hardware_map` (context_write) with what rom_reach shows so far: which
+   routines touch which hardware roles, the reset/NMI/IRQ entry roles, and (for
+   banked ROMs) bank-switch sites and their calling convention if visible.
+Then move on. Do not disassemble more than the reset and NMI entry here.
+"""
+[stages.excavate_fixed.tool_routing]
+default_region = "conversation"
+[stages.excavate_fixed.tool_routing.overrides]
+rom_reach  = { region = "trace", max_result_tokens = 10000 }
+rom_disasm = { region = "trace", max_result_tokens = 6000 }
+
+[stages.excavate_fixed.transitions.excavate_read]
+hint = "Routines queued in todos"
+transform = "direct"
+gate = { require_regions = ["hardware_map"] }
+
+[stages.excavate_fixed.transitions.recover]
+condition = "error"
+
+[stages.excavate_read]
+mode = "autonomous"
+description = "Read up to 4 queued routines (2 turns max), then hand to the write stage"
+model = { models = ["anthropic/claude-fable-5.1", "anthropic/claude-opus-5", "openai/gpt-5.6-sol"] }
+available_tools = ["rom_disasm", "rom_xrefs", "rom_bytes", "rom_entropy", "rom_ramlog"]
+max_iterations = 2
+max_revisits = 60
+system_prompt = """
+READ TURN. Pick the next 1-4 OPEN items in `todos` (skip ones already in
+`functions`; prefer callers before callees; group " [helper]" items together)
+and call rom_disasm(start=<addr>, follow=true, count=120) for each — several
+calls in one turn are fine. Use rom_xrefs on a RAM address only when a
+variable's role is unclear, and rom_ramlog (watch it over frames around
+the event that changes it) when its VALUES are unclear — never guess a
+variable's role or leave it "dual/unresolved" when a 3-second watch settles it. You get at most two turns here; then the write
+stage runs. Do not write anything here; the write stage does that.
+"""
+[stages.excavate_read.tool_routing]
+default_region = "conversation"
+[stages.excavate_read.tool_routing.overrides]
+rom_disasm  = { region = "trace", max_result_tokens = 9000 }
+rom_xrefs   = { region = "trace", max_result_tokens = 3000 }
+rom_ramlog  = { region = "trace", max_result_tokens = 3000 }
+rom_bytes   = { region = "trace", max_result_tokens = 2500 }
+rom_entropy = { region = "trace", max_result_tokens = 2500 }
+
+# "always": fires whether the 2-turn cap was hit or the model ended its turn
+# early (a plain "max_iterations" condition left an early finish with no exit
+# and killed the run — seen 2026-09-04 with Sonnet).
+[stages.excavate_read.transitions.excavate_write]
+hint = "Code read; write it up"
+condition = "always"
+transform = "direct"
+
+[stages.excavate_read.transitions.recover]
+condition = "error"
+
+[stages.excavate_write]
+mode = "autonomous"
+description = "Write catalog entries for everything just read; close their todos"
+model = { models = ["anthropic/claude-fable-5.1", "anthropic/claude-opus-5", "openai/gpt-5.6-sol"] }
+available_tools = ["context_append", "context_write", "todo_done", "todo_note", "write_file"]
+max_iterations = 4
+max_revisits = 60
+system_prompt = """
+WRITE TURN. The `trace` region holds the code read in the last read turn. For
+EVERY routine there, context_append to region `functions` with key
+"fixed:<addr>" (the key is the ONLY place an address may appear) and content:
+  name: <role-based snake_case name you invent>
+  behavior: <2-8 plain-language sentences of WHAT it does; NO addresses, NO mnemonics, NO byte values>
+  inputs: <RAM variables by role name, controller state, PPU state ...>
+  outputs: <EVERY variable it stores, by role name — including defaults it
+    reloads and flags it sets/clears (e.g. "resets the object position to its spawn
+    point AND sets vertical direction to down"). A reset routine's complete
+    store list is behavior; omitting one store breaks the reimplementation>
+  constants: <magic numbers with meaning, e.g. "gravity 2 subpixels per frame squared">
+  calls: <role names of callees>   callers: <role names>
+  hardware: <registers used, described by ROLE, e.g. "OAM DMA trigger">
+  video_uploads: <for any write to video memory: WHICH region (palette entry N,
+    nametable row/col, attribute, pattern table) and the literal VALUES when
+    constant — e.g. "sets background palette 0 to colors 15,48,16,0 at boot">
+  bank_switches: <bank changed and why, or "none">
+Palette values, screen positions and tile numbers are BEHAVIOR (a
+reimplementer needs them); only CPU/ROM addresses are forbidden.
+Generic runtime helpers ([helper] items: multiply/divide, copy loops,
+decimal/string conversion, delay loops, stack-frame glue) go into ONE combined
+entry with key "fixed:runtime_helpers" — one line each; append to it as you go.
+Then todo_done each routine you wrote up (by its item id). Keep the RAM
+variable list in `scratch` (context_write, "name: meaning" lines) and refine
+`hardware_map` (context_write) when you learn how the NMI handler, the main
+loop, and controller reading fit together. For banked ROMs, todo_add-style
+items for bank entry points are written with todo_note on the routine that
+switches banks, naming the target bank and address and what the caller expects.
+
+You cannot leave this stage until `functions` has new entries. When done:
+open items remain → excavate_read; nothing open and the ROM has switchable
+banks → excavate_banks; nothing open and no switchable banks → excavate_data.
+Before the final exit write analysis/fixed.json (write_file): ram_variables
+(name, meaning, size), routines (name, behavior, calls), frame_model,
+bank_convention, queued bank entry points.
+"""
+[stages.excavate_write.tool_routing]
+default_region = "conversation"
+
+[stages.excavate_write.transitions.excavate_read]
+hint = "Entries written; open items remain"
+transform = "direct"
+gate = { require_region_updated = "functions", message = "Append the entries for the routines in `trace` to `functions` first." }
+
+[stages.excavate_write.transitions.excavate_banks]
+hint = "All fixed-bank items closed and the ROM has switchable PRG banks"
+transform = "direct"
+gate = { require_region_updated = "functions" }
+
+[stages.excavate_write.transitions.excavate_data]
+hint = "All items closed; no switchable banks"
+transform = "direct"
+gate = { require_region_updated = "functions", require_no_open_items = "todos", message = "Close (todo_done) or annotate (todo_note) every open item first." }
+
+[stages.excavate_write.transitions.recover]
+condition = "error"
+
+# ─── Stage 3: Fan out per switchable bank ────────────────────────────────────
+[stages.excavate_banks]
+mode = "fan_out"
+description = "One worker per switchable PRG bank"
+model = { models = ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna"] }
+worker_agent = "genesis-reader-worker"
+merge_stage = "merge_banks"
+max_workers = 6
+on_worker_failure = "continue"
+max_attempts = 3
+split_prompt = """
+Read `rom_structure`, the `todos` region, and analysis/fixed.json (it is in the
+conversation if you read it; otherwise assume the todo items). Output ONLY a JSON
+array: the very first character of your reply is '[' and the very last is
+']'. NO markdown code fence (no ```), no "json" label, no prose — a fenced
+reply parses as zero items and the fan-out is skipped. One item per switchable
+PRG bank that has at least one queued entry point or that has never been
+analyzed. Workers inherit NOTHING from this run, so each item must be
+self-contained: THIS IS YOUR ONLY TURN AND YOU HAVE NO TOOLS: do not emit an
+"inspect", "read" or "survey" item to gather information first (a run lost its
+whole worker round to one such item) — the regions in this prompt are all the
+information there is; produce the final array of real work items now.
+
+[{"id": "bank-3",
+  "context": {
+    "bank": 3,
+    "entry_points": ["$8000", "$8123"],
+    "expectations": "entry $8000: level loader called from the stage-start routine; ...",
+    "rom_structure": "<the full rom_structure text>",
+    "bank_convention": "<how cross-bank calls work, from analysis/fixed.json>",
+    "ram_variables": "<the role-named RAM variable list so far, name: meaning, one per line>",
+    "known_routines": "<role names of fixed-bank routines a bank may call, one per line with a 1-line meaning>"
+  }}]
+
+On a second round only emit banks that still have unresolved items. If nothing
+remains, output exactly: []
+"""
+
+[stages.merge_banks]
+mode = "autonomous"
+description = "Reconcile per-bank findings into the shared catalog"
+model = { models = ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna"] }
+available_tools = ["read_file", "read_files", "list_dir", "write_file", "context_append", "context_write", "context_read", "todo_add", "todo_done", "todo_note"]
+max_iterations = 40
+max_revisits = 3
+system_prompt = """
+The bank workers' summaries are in your conversation and their full findings are
+in analysis/bank_*.json. Merge them:
+1. Read every analysis/bank_*.json (read_files).
+2. For each routine, context_append to `functions` with its key and the same
+   field layout used by the fixed bank (name/behavior/inputs/outputs/constants/
+   calls/callers/hardware/bank_switches). For each data item, context_append to
+   `data_tables` with its key.
+3. Unify RAM variable names: if two banks named the same variable differently,
+   pick one and note the alias in `scratch`. Write the merged list to
+   analysis/ram_variables.json.
+4. Resolve cross-bank calls: every `cross_bank_calls.target` should now exist in
+   `functions`; if not, todo_add "bank <M> entry <target>: <why>" so a second
+   fan-out round covers it. Mark bank items that are complete with todo_done.
+5. Record any new compression schemes or sound data found in `compression` /
+   `sound_engine` (context_write, merging with what is there).
+
+If open "bank N entry" items remain, go back to excavate_banks (round 2).
+Otherwise go to excavate_data.
+"""
+[stages.merge_banks.tool_routing]
+default_region = "conversation"
+[stages.merge_banks.tool_routing.overrides]
+read_files = { region = "trace", max_result_tokens = 30000 }
+read_file  = { region = "trace", max_result_tokens = 20000 }
+
+[stages.merge_banks.transitions.excavate_banks]
+hint = "Unresolved cross-bank entry points remain; run another worker round"
+transform = "compact"
+
+[stages.merge_banks.transitions.excavate_data]
+hint = "All banks merged and cross-bank calls resolved"
+transform = "compact"
+gate = { require_no_open_items = "todos", message = "Close (todo_done) or annotate (todo_note) every open item first." }
+
+[stages.merge_banks.transitions.recover]
+condition = "error"
+
+# ─── Stage 4: Data + sound engine (plan → read ⇄ write loop) ─────────────────
+# Same structure as excavation: a read stage with ROM tools and a hard turn cap,
+# a write stage that cannot be left until it recorded progress. A single
+# autonomous stage here read the ROM 109 times and wrote once (2026-09-05).
+[stages.excavate_data]
+mode = "autonomous"
+description = "Queue the data-stage jobs as todo items"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["todo_add", "context_write"]
+max_iterations = 3
+system_prompt = """
+The region `data_jobs` lists the jobs that remain before the spec can be
+written (A data ranges, A1 format proofs, A2 video state, A3 motion
+timelines, A4 random numbers, B sound engine, C acceptance observations). Call todo_add once
+per job, in that order, with the job letter and a one-line summary. Then
+say you are done.
+"""
+[stages.excavate_data.transitions.data_read]
+hint = "Jobs queued"
+transform = "direct"
+gate = { require_region_updated = "todos", message = "todo_add the data-stage jobs first." }
+[stages.excavate_data.transitions.recover]
+condition = "error"
+
+[stages.data_read]
+mode = "autonomous"
+description = "Read turn: ROM tools only, 3 turns, then write"
+model = { models = ["anthropic/claude-fable-5.1", "anthropic/claude-opus-5", "openai/gpt-5.6-sol"] }
+available_tools = ["rom_reach", "rom_disasm", "rom_xrefs", "rom_bytes", "rom_entropy", "rom_chr", "rom_apu", "rom_vram", "rom_observe", "rom_oamlog", "rom_ramlog", "rom_apu_trace", "rom_decode_try", "read_file"]
+max_iterations = 3
+max_revisits = 18
+system_prompt = """
+READ TURN. Take the FIRST open item in `todos` (its instructions are in
+`data_jobs`; `progress` says what earlier rounds already established for
+it). Call the ROM/emulator tools that job needs — several calls per turn are
+fine, three turns at most — then stop; the write turn records the results.
+Do not write anything here. Do not re-read code already summarized in
+`functions` or `progress`.
+"""
+[stages.data_read.tool_routing]
+default_region = "conversation"
+[stages.data_read.tool_routing.overrides]
+rom_disasm     = { region = "trace", max_result_tokens = 9000 }
+rom_reach      = { region = "trace", max_result_tokens = 10000 }
+rom_bytes      = { region = "trace", max_result_tokens = 4000 }
+rom_entropy    = { region = "trace", max_result_tokens = 4000 }
+rom_decode_try = { region = "trace", max_result_tokens = 3000 }
+rom_xrefs      = { region = "trace", max_result_tokens = 4000 }
+rom_vram       = { region = "trace", max_result_tokens = 6000 }
+rom_observe    = { region = "trace", max_result_tokens = 5000 }
+rom_oamlog     = { region = "trace", max_result_tokens = 5000 }
+rom_ramlog     = { region = "trace", max_result_tokens = 3000 }
+rom_apu_trace  = { region = "trace", max_result_tokens = 4000 }
+rom_chr        = { region = "trace", max_result_tokens = 4000 }
+rom_apu        = { region = "trace", max_result_tokens = 6000 }
+read_file      = { region = "trace", max_result_tokens = 6000 }
+[stages.data_read.transitions.data_write]
+hint = "Read; now record"
+condition = "always"
+transform = "direct"
+[stages.data_read.transitions.recover]
+condition = "error"
+
+[stages.data_write]
+mode = "autonomous"
+description = "Write turn: record findings, mark job progress"
+model = { models = ["anthropic/claude-fable-5.1", "anthropic/claude-opus-5", "openai/gpt-5.6-sol"] }
+available_tools = ["context_write", "context_append", "context_read", "todo_done", "todo_note", "write_file"]
+max_iterations = 4
+max_revisits = 18
+system_prompt = """
+WRITE TURN. `trace` holds what the read turn fetched. Record it NOW, in the
+regions the job in `data_jobs` names: data ranges → context_append
+`data_tables` (key "<bank>:<start>"); video state, TIMELINES and ACCEPTANCE
+facts → context_write `hardware_map` (merge with what is there — keep
+earlier headings); sound → context_write `sound_engine`; compression →
+context_write `compression` (or the word none); decoders → write_file
+spec/decoders/<name>.rhai. Then context_append to `progress` with the job
+letter as key: what is now established, what is still missing for that
+job. If the job is complete, todo_done it; otherwise todo_note it with the
+exact next reads. You cannot leave this stage until `progress` has a new
+entry. Open items remain → data_read. All closed → specification.
+"""
+[stages.data_write.tool_routing]
+default_region = "conversation"
+[stages.data_write.transitions.data_read]
+hint = "Progress recorded; jobs remain"
+transform = "direct"
+gate = { require_region_updated = "progress", message = "Append this round's findings to `progress` (and the job's regions) first." }
+[stages.data_write.transitions.specification]
+hint = "Every data-stage job closed"
+transform = "compact"
+gate = { require_region_updated = "progress", require_no_open_items = "todos", require_regions = ["sound_engine", "compression"], message = "Before leaving: close every job (todo_done), write `sound_engine` (or none) and `compression` (or none), and record progress." }
+[stages.data_write.transitions.recover]
+condition = "error"
+
+# ─── Stage 5: Specification ──────────────────────────────────────────────────
+[stages.specification]
+mode = "autonomous"
+description = "Write spec/behavioral_spec.json and spec/asset_manifest.json"
+model = { models = ["anthropic/claude-fable-5.1", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file", "read_files", "list_dir", "write_file", "edit_file", "context_read", "rom_lint_spec"]
+max_iterations = 40
+system_prompt = """
+Turn the catalog (`functions`, `data_tables`, `hardware_map`, `sound_engine`,
+`compression`, `rom_structure`) into two files.
+
+1. spec/behavioral_spec.json — THE DOCUMENT THAT CROSSES THE CLEAN-ROOM
+   BARRIER. It must let a programmer who has never seen the ROM rebuild the
+   game. Shape (all keys required unless noted):
+   {
+    "game": {"title", "mapper_name", "mapper_number", "prg_banks", "chr_banks",
+             "chr_ram", "mirroring", "bank_classes": [{"bank_class": "fixed"|"switchable", "count"}]},
+    "systems": [{"name", "behavior" (>= 40 chars, plain language), "frequency",
+                 "inputs": [], "outputs": [], "constants": [{"name","value","unit","description"}],
+                 "state_touched": []}],
+    "state_machine": {"states": [], "transitions": [{"from","to","trigger"}]},
+    "ram_variables": [{"name" (snake_case role), "type": "u8"|"u16"|"i8"|"i16"|"flags"|"array"|"struct",
+                       "description", "size_bytes"}],
+    "assets": [{"id" (snake_case), "kind": "pattern_table"|"palette"|"tilemap"|"level"|"audio"|"text"|"table"|"blob",
+                "description", "tile_count"|"byte_count"|"dimensions", "bank_class", "format": "raw" or a runtime_formats name}],
+    "video": {"initial_palettes": [{"name","kind":"background"|"sprite","index":0-3,"colors":[the 4 values OBSERVED in PPU palette RAM via rom_observe, 0-63],"description"}],
+              "initial_screen": "<what is drawn at boot: text, borders, tile layout, positions>",
+              "ppu_settings": "<sprite size, pattern table use, NMI, rendering mask, in words>", "scroll_model"}  (REQUIRED whenever the game draws anything),
+    "sound_engine": {"driver_family", "channels": [], "sequence_grammar", "tick_behavior", "sfx_priority", "tempo_model", "register_trace_head": [{"event": "<title music start|gameplay music start|effect N>", "frames": [{"frame": N, "writes": ["<register role>=<value>", ...]}]}]}  (optional if no audio; register_trace_head REQUIRED when present),
+    a system named "random_number_generator" (REQUIRED whenever anything is placed or chosen randomly): behavior = the exact update rule in words, constants = width, seed, bits per call, outputs = the state variable(s), plus "call_sites": [{"system", "calls_per_frame", "order"}] and "first_values": [{"frame": N, "value": "<state after the call>"}] from hardware_map RANDOM NUMBERS,
+    "runtime_formats": [{"name", "description" (decoding grammar in words), "decoded_size_rule"}],
+    "acceptance_observations": [{"when": "<frame number and input, e.g. 'frame 700, start pressed at 500'>", "expect": "<what is observable: screen text/rows, palette values, sprite count, HUD score, sound-register writes per frame>"}]  (REQUIRED: 8-15 entries taken from the ACCEPTANCE notes in hardware_map),
+    "timelines": [{"name": "<object/event>", "trigger": "<input and frame>", "entries": [{"frame": N, "observation": "<slot, x, y, tile, attribute; or 'no change (lag frame)'; or 'screen switches to ...'>"}], "animation": "<attribute/tile cycle, period, phase>", "notes"}]  (REQUIRED whenever anything moves: one per TIMELINES heading in hardware_map, frame-exact, 6-20 entries each; every entry carries the LITERAL numbers from rom_oamlog — slot index, x, y, tile, attribute byte as observed — never "approximately", and `animation` lists the exact attribute-byte sequence with its period and the frame it starts on),
+    "data_tables": [{"name", "format", "dimensions"|"byte_count", "purpose"}],
+    "notes": "<anything a reimplementer must know>"
+   }
+   Group routines into systems (input polling, physics, collision, camera/scroll,
+   rendering/vram updates, sprite animation, entity AI per type, level loading,
+   HUD, audio, RNG, title/menu flow). Every constant that affects behavior
+   (speeds, accelerations, timers, table sizes) must appear with its value.
+   Rates and caps (writes drained per frame, timers) must come from observation
+   or the code's actual loop bounds, never guessed. Every reset/respawn/spawn
+   system must list ALL the variables it reloads (positions, speeds, direction
+   flags, animation counters) — take them from the routines' `outputs`.
+   Sprite details are behavior: runtime OAM slot order, which states show no
+   sprites at all, and per-object attribute/tile animation cycles.
+   ABSOLUTELY NO memory addresses, ROM offsets, bank numbers, instruction
+   names, or hex byte dumps anywhere in this file — the validator rejects them.
+   Refer to assets only by their "id".
+
+2. spec/asset_manifest.json — STAYS ON THIS SIDE of the barrier (used only by
+   the build-time extractor). Shape:
+   {"rom_format": {"mapper": <integer>, "prg_banks": <integer>, "chr_rom_banks": <integer>, "chr_ram": <boolean>, "sha256"?: <64 hex chars, only if you know it exactly>},
+    "assets": {"pattern_tables": [{"id","source":"chr"|"prg","bank","offset":"0x....","tile_count","description"}],
+               "palettes": [{"id","source","bank","offset","count","description"}],
+               "tilemaps": [{"id","source","bank","offset","format","byte_count","attribute_offset"?,"attribute_bytes"?,"description"}],
+               "audio": [{"id","source","bank","offset","byte_count","engine","description"}],
+               "level_data": [{"id","source","bank","offset","byte_count"?,"entries"?,"format":"raw"|"rle"|"pb53"|"lz"|"script:spec/decoders/<f>.rhai","description"}]},
+    "decoders": [{"name","script_path"}]}
+   Every asset id in the spec must appear exactly once here. Offsets are CPU
+   addresses ("0xC400") inside the named bank's window for source=prg, or byte
+   offsets within the CHR bank for source=chr. If the game decompresses data at
+   runtime, extract it as "raw" and make sure the spec's runtime_formats describe
+   the decoder so the reimplementation can decode it itself.
+
+Write both with write_file, re-read them to check they are valid JSON, then
+run rom_lint_spec and FIX every violation it reports (rewrite the sentence as
+behavior; addresses are never needed in the spec). Repeat until it prints
+"OK: no barrier violations". Only then move to publish.
+"""
+[stages.specification.tool_routing]
+default_region = "conversation"
+[stages.specification.tool_routing.overrides]
+read_file  = { region = "trace", max_result_tokens = 30000 }
+read_files = { region = "trace", max_result_tokens = 30000 }
+
+[stages.specification.transitions.publish]
+hint = "Both spec files are written"
+transform = "direct"
+gate = { require_modifications = true }
+
+[stages.specification.transitions.recover]
+condition = "error"
+
+# ─── Stage 6: Publish (validated) ────────────────────────────────────────────
+[stages.publish]
+mode = "output"
+description = "Submit the behavioral spec (validated by the barrier lint)"
+model = { models = ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna"] }
+available_tools = ["read_file"]
+max_iterations = 3
+system_prompt = """
+After submit_output is accepted, do NOTHING else: no more tool calls, no
+further text. One accepted submission ends the run.
+Read spec/behavioral_spec.json and submit its contents as the output. The
+submitted JSON is the canonical spec (scripts/handoff.sh takes it from the run
+result). If the validator rejects it, correct the JSON in your submission and
+submit again. Typical rejections: a stray address like "$C000" or "0x8000", an
+instruction name, or a hex byte dump inside a description — rewrite those
+sentences as behavior. Keep everything else identical.
+"""
+[stages.publish.output]
+format = "json"
+validator = "validators/spec.rhai"
+instructions = "The behavioral spec JSON object only — no prose, no code fences."
+
+# ─── Recovery ────────────────────────────────────────────────────────────────
+[stages.recover]
+mode = "output"
+description = "Explain what went wrong"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["context_read"]
+max_iterations = 4
+system_prompt = """
+A stage failed or got stuck. Submit a short recovery report as the output:
+which stage, what was being attempted, the last errors, and what a human
+should check.
+"""
+[stages.recover.output]
+format = "markdown"
+instructions = "The recovery report: which stage failed, why, and what to check."

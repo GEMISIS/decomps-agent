@@ -1,0 +1,296 @@
+# Remedy — GitHub-issue-driven bug fixer for a reimplementation repo.
+#
+# Writer-side rules: never sees the ROM, has no rom_* tools, shells run in the
+# same C-toolchain container as the writer. Input is one GitHub issue (seeded
+# into `issue` by scripts/remedy_poll.sh) and a checkout of the repo as workdir.
+
+[agent]
+name = "remedy"
+version = "0.1.0"
+description = "Triage → diagnose → patch → regress → open PR for one GitHub issue against a clean-room reimplementation"
+entry_stage = "triage"
+
+[tool_permissions]
+read_file  = "allow"
+read_files = "allow"
+list_dir   = "allow"
+write_file = "allow"
+edit_file  = "allow"
+shell      = "allow"
+web_search = "deny"
+web_fetch  = "deny"
+
+[sandbox]
+kind    = "container"
+engine  = "docker"
+image   = "nes-decomp-cc65:latest"
+network = false
+
+# LOCAL ONLY: nothing in this blueprint pushes, comments, or opens PRs online.
+# The fix lands on a local branch and the PR text is written to a file; a human
+# decides whether anything leaves the machine. (Remove `git push`/`gh` from the
+# deny list and add them to safe_commands only when you deliberately go online.)
+[safe_commands]
+allow = ["make", "cc65", "ca65", "ld65", "gcc", "xxd", "ls", "cat", "wc", "diff", "rm", "grep", "git status", "git diff", "git log", "git add", "git commit", "git checkout", "git switch", "git branch"]
+
+[compaction]
+provider = "openrouter"
+model = "openai/gpt-5.6-luna"
+
+[context.regions]
+task            = { kind = "pinned", budget = "2%", max_tokens = 2000, seed = "task", required = true, required_message = "Pass the issue number via --task, e.g. --task 42." }
+issue           = { kind = "pinned", budget = "6%", max_tokens = 10000, seed = { caller = "issue" }, required = true, required_message = "Seed the issue JSON with --issue @issue.json (scripts/remedy_poll.sh does this).", description = "The GitHub issue (title, body, labels, comments)" }
+behavioral_spec = { kind = "pinned", budget = "22%", max_tokens = 60000, seed = { files = ["spec/behavioral_spec.json"] }, volatility = "stable", summarizable = false, description = "Ground truth for intended behavior" }
+repo_files      = { kind = "pinned", budget = "3%", max_tokens = 5000, seed = { command = "git ls-files" } }
+c_conventions   = { kind = "pinned", budget = "8%", max_tokens = 20000, seed = { files = ["reference/c_conventions.md"] }, volatility = "stable", description = "cc65 / NES coding conventions, vblank budget, frame-exact rules" }
+classification  = { kind = "pinned", budget = "2%", max_tokens = 2000, required = true, required_message = "Write `classification` before leaving triage." }
+evidence        = { kind = "pinned", budget = "8%", max_tokens = 12000, description = "Observed vs expected values gathered by the reproduce stage (frames, sprite records, register writes, profile lines)" }
+root_cause      = { kind = "pinned", budget = "5%", max_tokens = 8000 }
+build_output    = { kind = "clearable", budget = "10%", max_tokens = 10000 }
+code            = { kind = "compacting", budget = "15%", max_tokens = 30000, compact_at = "80%" }
+conversation    = { kind = "sliding_window", max_items = 30, budget = "16%", max_tokens = 20000, strategy = "bulk", overflow = 15 }
+scratch         = { kind = "clearable", budget = "5%", max_tokens = 8000 }
+
+[stages.triage]
+mode = "autonomous"
+description = "Classify the issue and check it is actionable"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file", "list_dir", "context_write", "context_read"]
+max_iterations = 10
+system_prompt = """
+Read `issue` and `behavioral_spec`. Classify the report into exactly one of:
+  spec_gap      — the spec does not describe (or mis-describes) this behavior
+  code_bug      — the spec is clear and the code does not follow it
+  test_harness  — tests/build tooling problem, not game behavior
+  invalid       — not reproducible / not a defect / needs more info
+Write `classification` (context_write) as: "<class>: <one paragraph why>,
+severity: low|medium|high, reproducible: yes|no|unknown, area: <module guess>".
+If invalid, still continue to diagnose (it will explain and stop).
+"""
+[stages.triage.transitions.reproduce]
+hint = "Classified"
+gate = { require_regions = ["classification"] }
+[stages.triage.transitions.recover]
+condition = "error"
+
+[stages.reproduce]
+mode = "autonomous"
+description = "Reproduce the issue on the real build and collect the evidence (cheap model, tools only)"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file", "list_dir", "shell", "context_write", "context_read", "build_check", "build_hosttests", "build_profile", "build_ramlog", "build_observe", "build_oamlog", "build_apu_trace"]
+max_iterations = 14
+max_revisits = 3
+system_prompt = """
+You gather facts; you do not diagnose. `make` (assets/ holds the real data
+here), then reproduce the issue with the build tools at the frames the issue,
+the spec's `acceptance_observations` or `timelines` name: build_observe for
+screens (palette, "PPU CTRL=", "NT0 ROWS WRITTEN", attribute rows),
+build_oamlog for sprite records and motion, build_apu_trace for sound register
+cadence, build_ramlog for the variables involved, build_profile if timing is
+suspected, build_hosttests for test tickets. Take at most 8 tool observations,
+then write `evidence` (context_write) as a compact list: for each observation
+the frame(s), the exact observed values, and the expected values quoted from
+the issue or the spec, plus the file list (`git ls-files src include test`)
+and the module the issue points at. No hypotheses, no code reading beyond
+`grep -n` to locate symbols. Do NOT build throwaway trees or scratch programs.
+"""
+[stages.reproduce.tool_routing]
+default_region = "conversation"
+[stages.reproduce.tool_routing.overrides]
+read_file  = { region = "code", max_result_tokens = 8000 }
+shell      = { region = "build_output", max_result_tokens = 6000 }
+build_check     = { region = "build_output", max_result_tokens = 3000 }
+build_hosttests = { region = "build_output", max_result_tokens = 3000 }
+build_profile   = { region = "build_output", max_result_tokens = 3000 }
+build_ramlog    = { region = "build_output", max_result_tokens = 3000 }
+build_observe   = { region = "build_output", max_result_tokens = 6000 }
+build_oamlog    = { region = "build_output", max_result_tokens = 5000 }
+build_apu_trace = { region = "build_output", max_result_tokens = 4000 }
+[stages.reproduce.transitions.diagnose]
+hint = "Evidence collected"
+gate = { require_regions = ["evidence"] }
+transform = "compact"
+[stages.reproduce.transitions.recover]
+condition = "error"
+
+[stages.diagnose]
+mode = "autonomous"
+description = "Find the root cause in the C source (or the spec) from the evidence"
+model = { models = ["anthropic/claude-fable-5.1", "anthropic/claude-opus-5", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file", "read_files", "list_dir", "shell", "context_write", "context_read", "build_observe", "build_oamlog", "build_ramlog", "build_apu_trace"]
+max_iterations = 14
+max_revisits = 3
+system_prompt = """
+Find the root cause from `evidence` and the code. This stage is the expensive
+one: read, reason, write — at most 2 extra observations if the evidence
+leaves a hypothesis untested, no builds of throwaway trees, no scratch
+programs, no host-test experiments (the patch stage does that). Start from
+the module named in `classification`, read the relevant systems in
+`behavioral_spec`, then the code (`read_files` for several files at once).
+Common causes, in order of likelihood (see `c_conventions`): VRAM writes that
+overrun vblank (garbled rows, text tails restarting at their first column),
+a reset that forgets a direction/animation variable, a state transition that
+costs an extra frame, sound ticked from the wrong place, a `#pragma zpsym`
+on a symbol declared after it. Write
+`root_cause` (context_write): the file(s) and function(s) responsible, the exact
+divergence from the spec (quote the spec sentence and the offending code
+lines), and the minimal fix you propose. For spec_gap: state what the spec
+should say and which file/lines will change once it does. For invalid: explain
+why and what information would make it actionable. Never read or reason from
+anything but the spec and this repository.
+"""
+[stages.diagnose.tool_routing]
+default_region = "conversation"
+[stages.diagnose.tool_routing.overrides]
+read_file  = { region = "code", max_result_tokens = 12000 }
+read_files = { region = "code", max_result_tokens = 20000 }
+shell      = { region = "build_output", max_result_tokens = 8000 }
+build_check     = { region = "build_output", max_result_tokens = 3000 }
+build_profile   = { region = "build_output", max_result_tokens = 3000 }
+build_ramlog    = { region = "build_output", max_result_tokens = 3000 }
+build_observe   = { region = "build_output", max_result_tokens = 6000 }
+build_oamlog    = { region = "build_output", max_result_tokens = 5000 }
+build_apu_trace = { region = "build_output", max_result_tokens = 4000 }
+[stages.diagnose.transitions.patch]
+hint = "Root cause identified"
+gate = { require_regions = ["root_cause"] }
+[stages.diagnose.transitions.recover]
+condition = "stuck"
+stuck_after_iterations = 14
+
+[stages.patch]
+mode = "autonomous"
+description = "Minimal fix plus a regression test"
+model = { models = ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna"] }
+available_tools = ["read_file", "read_files", "list_dir", "write_file", "edit_file", "shell", "context_read"]
+max_iterations = 40
+system_prompt = """
+Apply the fix from `root_cause`: the smallest change that makes the code match
+the spec. Add or extend a host test in test/ that fails before and passes after.
+For spec_gap: edit spec/behavioral_spec.json to describe the behavior
+(behavior only — no addresses or code), then make the code follow it, and note
+in SPEC_CHANGES.md that Clean Room A should confirm the spec change on its next
+run. For invalid: write TRIAGE_NOTE.md and change no code. Reproduce the failure
+in a host test FIRST (`observe/host_tests_strict.sh .` runs the suite as the
+user's machine does), then fix, then re-run it. Keep scratch out of the tree:
+throwaway programs go under build/ (ignored), never in the repo root, and
+`root_cause` is a context region, not a file. Create a branch
+`remedy/issue-<n>` (git checkout -b) and commit ONLY src/, include/, test/,
+spec/, Makefile and *.md with a message that references the issue:
+"Fix #<n>: <summary>". Do not push here.
+"""
+[stages.patch.tool_routing]
+default_region = "conversation"
+[stages.patch.tool_routing.overrides]
+shell      = { region = "build_output", max_result_tokens = 8000 }
+read_file  = { region = "code", max_result_tokens = 12000 }
+[stages.patch.transitions.regress]
+hint = "Fix and test committed"
+gate = { require_modifications = true }
+[stages.patch.transitions.recover]
+condition = "error"
+
+[stages.regress]
+mode = "autonomous"
+description = "Full build and test suite"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file", "shell", "context_read", "context_write", "build_check", "build_hosttests", "build_profile", "build_ramlog", "build_observe", "build_oamlog", "build_apu_trace"]
+max_iterations = 20
+max_revisits = 2
+system_prompt = """
+Run `make clean && make stub-assets && make`, then build_hosttests (the host
+tests with the strict flags the user's machine applies; plain `make test`
+passes in this sandbox and still fails there — a test file you added or edited
+must compile with -Werror and be wired into the Makefile's test target).
+Then re-run the
+observation from `root_cause` (build_observe / build_oamlog / build_apu_trace
+at the same frames) and confirm the observed values now match the issue's
+expectation; write PASS/FAIL with values into `root_cause` (append).
+NO REGRESSIONS: the issue lists checks that pass today and must keep
+passing. Re-run build_check (frames 120) and build_observe at every screen
+the spec's acceptance observations name (title, gameplay, game over): the
+"PPU CTRL=" line, the palette and the attribute rows must still match the
+spec's `video` section for each screen. A patch that fixes its ticket but
+changes another screen's PPU settings, palette or layout is rejected — go
+back to diagnose and fix it without the side effect. If
+anything fails that passed before the patch, or the observation still
+differs, write the failure into `root_cause` (append) and go back to
+diagnose. A patch that changed only test/ files, or loosened an
+assertion, is not a fix even if everything is green: `git diff --stat HEAD~1
+-- src include` must be non-empty for a code_bug ticket (spec_gap tickets
+may change spec/ instead); otherwise write why into `root_cause` and go back
+to diagnose. If all is green, go to finalize.
+"""
+[stages.regress.tool_routing]
+default_region = "conversation"
+[stages.regress.tool_routing.overrides]
+shell = { region = "build_output", max_result_tokens = 10000 }
+build_check     = { region = "build_output", max_result_tokens = 3000 }
+build_profile   = { region = "build_output", max_result_tokens = 3000 }
+build_ramlog    = { region = "build_output", max_result_tokens = 3000 }
+build_observe   = { region = "build_output", max_result_tokens = 6000 }
+build_oamlog    = { region = "build_output", max_result_tokens = 5000 }
+build_apu_trace = { region = "build_output", max_result_tokens = 4000 }
+[stages.regress.transitions.diagnose]
+hint = "New failures appeared"
+transform = "compact"
+[stages.regress.transitions.finalize]
+hint = "Build and tests green"
+[stages.regress.transitions.recover]
+condition = "error"
+
+[stages.finalize]
+mode = "autonomous"
+description = "Write the PR description locally (no push, no network)"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file", "write_file", "shell", "context_read", "context_write"]
+max_iterations = 8
+system_prompt = """
+Do NOT push, do NOT run gh, do NOT contact GitHub. Everything stays local.
+`git status --porcelain` must show no untracked files outside src/, include/,
+test/, spec/ (delete any scratch you or an earlier stage left, e.g. a
+root_cause dump) and no uncommitted changes — commit anything left over.
+If the classification is not invalid: write .remedy/pr-<n>.md containing the
+PR title ("Fix #<n>: <summary>") and body (root cause, fix, tests; ending with
+"Closes #<n>"), and confirm the branch remedy/issue-<n> holds the commit
+(`git log --oneline -3`). If invalid: write .remedy/triage-<n>.md with what
+information is needed. Then move to the report stage.
+"""
+[stages.finalize.transitions.report]
+hint = "PR text written locally"
+gate = { require_modifications = true }
+[stages.finalize.transitions.recover]
+condition = "error"
+
+[stages.report]
+mode = "output"
+description = "Hand back the JSON report"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file", "context_read"]
+max_iterations = 3
+system_prompt = """
+After submit_output is accepted, do NOTHING else: no more tool calls, no
+further text. One accepted submission ends the run.
+Submit the report as JSON: {"issue_number", "classification", "root_cause",
+"files_changed": [], "tests_added": [], "spec_changed": bool, "branch",
+"pr_file", "summary"}. Read .remedy/pr-<n>.md or .remedy/triage-<n>.md for
+the details.
+"""
+[stages.report.output]
+format = "json"
+instructions = "The JSON report object only."
+
+[stages.recover]
+mode = "output"
+description = "Explain what went wrong"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["context_read"]
+max_iterations = 4
+system_prompt = """
+A stage failed or got stuck. Submit a short recovery report as the output:
+which stage, what was being attempted, the last errors, and what a human
+should check.
+"""
+[stages.recover.output]
+format = "markdown"
+instructions = "The recovery report: which stage failed, why, and what to check."

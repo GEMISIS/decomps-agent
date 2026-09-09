@@ -1,0 +1,895 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://leviath.dev/schemas/nes-decomp/behavioral_spec.schema.json",
+ "title": "NES Behavioral Specification",
+ "description": "The only artifact that crosses the clean-room barrier. Describes what a game does, never how its original code or data is laid out. No addresses, offsets, bank numbers, opcodes or byte listings are permitted anywhere in this document.",
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "game",
+  "systems",
+  "state_machine",
+  "ram_variables",
+  "assets"
+ ],
+ "properties": {
+  "game": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "title",
+    "mapper_name",
+    "mapper_number",
+    "prg_banks",
+    "chr_banks",
+    "chr_ram",
+    "mirroring",
+    "bank_classes"
+   ],
+   "properties": {
+    "title": {
+     "type": "string",
+     "minLength": 1
+    },
+    "mapper_name": {
+     "type": "string",
+     "enum": [
+      "NROM",
+      "MMC1",
+      "UxROM",
+      "CNROM",
+      "MMC3"
+     ]
+    },
+    "mapper_number": {
+     "type": "integer",
+     "enum": [
+      0,
+      1,
+      2,
+      3,
+      4
+     ]
+    },
+    "prg_banks": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 64,
+     "description": "Count of 16 KB program banks."
+    },
+    "chr_banks": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 64,
+     "description": "Count of 8 KB character ROM banks; 0 for CHR-RAM boards."
+    },
+    "chr_ram": {
+     "type": "boolean"
+    },
+    "mirroring": {
+     "type": "string",
+     "enum": [
+      "horizontal",
+      "vertical",
+      "four_screen",
+      "mapper_controlled"
+     ]
+    },
+    "prg_ram": {
+     "type": "boolean"
+    },
+    "battery": {
+     "type": "boolean"
+    },
+    "region": {
+     "type": "string",
+     "enum": [
+      "ntsc",
+      "pal",
+      "dual"
+     ]
+    },
+    "bank_classes": {
+     "type": "array",
+     "minItems": 1,
+     "items": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+       "bank_class",
+       "count"
+      ],
+      "properties": {
+       "bank_class": {
+        "type": "string",
+        "enum": [
+         "fixed",
+         "switchable"
+        ]
+       },
+       "count": {
+        "type": "integer",
+        "minimum": 1
+       },
+       "description": {
+        "type": "string"
+       }
+      }
+     }
+    },
+    "frame_model": {
+     "type": "string",
+     "enum": [
+      "nmi_driven",
+      "flag_driven",
+      "mixed"
+     ],
+     "description": "Whether per-frame game logic runs inside the vblank interrupt, in a main loop gated by a flag, or both."
+    },
+    "summary": {
+     "type": "string"
+    }
+   }
+  },
+  "systems": {
+   "type": "array",
+   "minItems": 1,
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "name",
+     "behavior"
+    ],
+    "properties": {
+     "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+     },
+     "behavior": {
+      "type": "string",
+      "minLength": 40,
+      "description": "Prose description of what the system does, in enough detail to reimplement it."
+     },
+     "frequency": {
+      "type": "string",
+      "description": "When it runs: once per frame, on demand, on state entry, every N frames..."
+     },
+     "inputs": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "outputs": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "constants": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+        "name",
+        "value"
+       ],
+       "properties": {
+        "name": {
+         "type": "string",
+         "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "value": {
+         "type": [
+          "number",
+          "string",
+          "boolean"
+         ]
+        },
+        "unit": {
+         "type": "string"
+        },
+        "description": {
+         "type": "string"
+        }
+       }
+      }
+     },
+     "state_touched": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "depends_on": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "assets_used": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "confidence": {
+      "type": "string",
+      "enum": [
+       "high",
+       "medium",
+       "low"
+      ]
+     },
+     "open_questions": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "call_sites": {
+      "type": "array",
+      "description": "random_number_generator only: who advances it, how often per frame, in what order",
+      "items": {
+       "type": "object",
+       "properties": {
+        "system": {
+         "type": "string"
+        },
+        "calls_per_frame": {
+         "type": [
+          "integer",
+          "string"
+         ]
+        },
+        "order": {
+         "type": [
+          "integer",
+          "string"
+         ]
+        }
+       },
+       "additionalProperties": true
+      }
+     },
+     "first_values": {
+      "type": "array",
+      "description": "random_number_generator only: observed state after the first calls of gameplay (acceptance table)",
+      "items": {
+       "type": "object",
+       "properties": {
+        "frame": {
+         "type": "integer"
+        },
+        "value": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "frame",
+        "value"
+       ],
+       "additionalProperties": true
+      }
+     }
+    }
+   }
+  },
+  "state_machine": {
+   "type": "object",
+   "additionalProperties": false,
+   "required": [
+    "states",
+    "transitions"
+   ],
+   "properties": {
+    "initial_state": {
+     "type": "string"
+    },
+    "states": {
+     "type": "array",
+     "minItems": 1,
+     "items": {
+      "oneOf": [
+       {
+        "type": "string",
+        "minLength": 1
+       },
+       {
+        "type": "object",
+        "required": [
+         "name"
+        ],
+        "properties": {
+         "name": {
+          "type": "string"
+         },
+         "description": {
+          "type": "string"
+         }
+        },
+        "additionalProperties": true
+       }
+      ]
+     }
+    },
+    "transitions": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+       "from",
+       "to",
+       "trigger"
+      ],
+      "properties": {
+       "from": {
+        "type": "string"
+       },
+       "to": {
+        "type": "string"
+       },
+       "trigger": {
+        "type": "string"
+       },
+       "effects": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  },
+  "ram_variables": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "name",
+     "type",
+     "description"
+    ],
+    "properties": {
+     "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+     },
+     "type": {
+      "type": "string",
+      "enum": [
+       "u8",
+       "u16",
+       "i8",
+       "i16",
+       "flags",
+       "array",
+       "struct"
+      ]
+     },
+     "description": {
+      "type": "string"
+     },
+     "size_bytes": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "element_type": {
+      "type": "string",
+      "enum": [
+       "u8",
+       "u16",
+       "i8",
+       "i16",
+       "flags",
+       "struct"
+      ]
+     },
+     "count": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "fields": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+        "name",
+        "description"
+       ],
+       "properties": {
+        "name": {
+         "type": "string",
+         "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "type": {
+         "type": "string",
+         "enum": [
+          "u8",
+          "u16",
+          "i8",
+          "i16",
+          "flags"
+         ]
+        },
+        "description": {
+         "type": "string"
+        }
+       }
+      }
+     },
+     "flag_bits": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+        "name",
+        "meaning"
+       ],
+       "properties": {
+        "name": {
+         "type": "string",
+         "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "meaning": {
+         "type": "string"
+        }
+       }
+      }
+     },
+     "range": {
+      "type": "string"
+     },
+     "persistent": {
+      "type": "boolean",
+      "description": "True if stored in battery-backed RAM."
+     },
+     "hot": {
+      "type": "boolean",
+      "description": "Accessed every frame in inner loops; hint for zero-page placement."
+     }
+    }
+   }
+  },
+  "assets": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "id",
+     "kind",
+     "description"
+    ],
+    "properties": {
+     "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+     },
+     "kind": {
+      "type": "string",
+      "enum": [
+       "pattern_table",
+       "palette",
+       "tilemap",
+       "level",
+       "audio",
+       "text",
+       "table",
+       "blob"
+      ]
+     },
+     "description": {
+      "type": "string"
+     },
+     "tile_count": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "byte_count": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "dimensions": {
+      "anyOf": [
+       {
+        "type": "array",
+        "items": {
+         "type": "integer"
+        },
+        "minItems": 1,
+        "maxItems": 4
+       },
+       {
+        "type": "string"
+       }
+      ],
+      "description": "[width, height] in tiles/bytes, or a description when the asset is not a single rectangle"
+     },
+     "entry_count": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "bank_class": {
+      "type": "string",
+      "enum": [
+       "fixed",
+       "switchable"
+      ]
+     },
+     "format": {
+      "type": "string",
+      "description": "\"raw\", or the name of a runtime_formats entry the game decodes at run time."
+     },
+     "used_by": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "anyOf": [
+     {
+      "required": [
+       "tile_count"
+      ]
+     },
+     {
+      "required": [
+       "byte_count"
+      ]
+     },
+     {
+      "required": [
+       "dimensions"
+      ]
+     }
+    ]
+   }
+  },
+  "sound_engine": {
+   "anyOf": [
+    {
+     "type": "object",
+     "properties": {
+      "channels": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "sequence_grammar": {
+       "type": "string"
+      },
+      "tick_behavior": {
+       "type": "string"
+      },
+      "sfx_priority": {
+       "type": "string"
+      },
+      "tempo_model": {
+       "type": "string"
+      },
+      "driver_family": {
+       "type": "string",
+       "description": "FamiTone2 | FamiStudio | Pently | custom (described)"
+      },
+      "register_trace_head": {
+       "type": "array",
+       "description": "verbatim register writes for the first frames of each music start / effect; the writer's audio acceptance test",
+       "items": {
+        "type": "object",
+        "properties": {
+         "event": {
+          "type": "string"
+         },
+         "frames": {
+          "type": "array",
+          "items": {
+           "type": "object",
+           "properties": {
+            "frame": {
+             "type": "integer"
+            },
+            "writes": {
+             "type": "array",
+             "items": {
+              "type": "string"
+             }
+            }
+           },
+           "required": [
+            "frame",
+            "writes"
+           ],
+           "additionalProperties": true
+          }
+         }
+        },
+        "required": [
+         "event",
+         "frames"
+        ],
+        "additionalProperties": true
+       }
+      }
+     },
+     "additionalProperties": true
+    },
+    {
+     "type": "null"
+    }
+   ]
+  },
+  "runtime_formats": {
+   "anyOf": [
+    {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+       "name",
+       "description"
+      ],
+      "properties": {
+       "name": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+       },
+       "description": {
+        "type": "string",
+        "minLength": 40,
+        "description": "Prose grammar of the encoding, sufficient to write a decoder."
+       },
+       "decoded_size_rule": {
+        "type": "string"
+       },
+       "used_by_assets": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "worked_example": {
+        "type": "string",
+        "description": "A small synthetic example (not taken from the game's data) to test a decoder against."
+       }
+      }
+     }
+    },
+    {
+     "type": "null"
+    }
+   ]
+  },
+  "data_tables": {
+   "anyOf": [
+    {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+       "name",
+       "format",
+       "purpose"
+      ],
+      "properties": {
+       "name": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+       },
+       "format": {
+        "type": "string"
+       },
+       "purpose": {
+        "type": "string"
+       },
+       "dimensions": {
+        "anyOf": [
+         {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "items": {
+           "type": "integer",
+           "minimum": 1
+          }
+         },
+         {
+          "type": "string"
+         }
+        ]
+       },
+       "byte_count": {
+        "type": "integer",
+        "minimum": 1
+       },
+       "values": {
+        "type": "array",
+        "description": "Small gameplay tables (speeds, timers, damage) may be transcribed as decimal values; graphics, maps and music are assets, not tables.",
+        "maxItems": 256,
+        "items": {
+         "type": [
+          "number",
+          "string",
+          "boolean",
+          "null"
+         ]
+        }
+       },
+       "asset_id": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+       }
+      }
+     }
+    },
+    {
+     "type": "null"
+    }
+   ]
+  },
+  "notes": {
+   "anyOf": [
+    {
+     "type": "string"
+    },
+    {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    }
+   ]
+  },
+  "video": {
+   "anyOf": [
+    {
+     "type": "object",
+     "additionalProperties": false,
+     "properties": {
+      "initial_palettes": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+         "name": {
+          "type": "string"
+         },
+         "kind": {
+          "type": "string",
+          "enum": [
+           "background",
+           "sprite"
+          ]
+         },
+         "index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+         },
+         "colors": {
+          "type": "array",
+          "items": {
+           "type": "integer",
+           "minimum": 0,
+           "maximum": 63
+          },
+          "minItems": 1,
+          "maxItems": 4
+         },
+         "description": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "kind",
+         "index",
+         "colors"
+        ]
+       }
+      },
+      "initial_screen": {
+       "type": "string",
+       "description": "What is on screen after boot, in words: layout, text, borders, which tiles/attributes, scroll position"
+      },
+      "ppu_settings": {
+       "type": "string",
+       "description": "Sprite size, pattern table assignment for background/sprites, NMI use, rendering mask, emphasis, in words"
+      },
+      "scroll_model": {
+       "type": "string"
+      }
+     }
+    },
+    {
+     "type": "null"
+    }
+   ]
+  },
+  "acceptance_observations": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+     "when": {
+      "type": "string"
+     },
+     "expect": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "when",
+     "expect"
+    ]
+   }
+  },
+  "timelines": {
+   "anyOf": [
+    {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+       "name": {
+        "type": "string",
+        "description": "Object or event, e.g. 'ball after match start', 'player respawn'"
+       },
+       "trigger": {
+        "type": "string",
+        "description": "What starts the timeline, in frames relative to an input, e.g. 'start pressed at frame 500'"
+       },
+       "entries": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "additionalProperties": false,
+         "properties": {
+          "frame": {
+           "type": "integer",
+           "minimum": 0
+          },
+          "observation": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "frame",
+          "observation"
+         ]
+        }
+       },
+       "animation": {
+        "type": "string",
+        "description": "Tile/attribute cycle in words: sequence, period in frames, phase relative to the trigger, whether it keeps running while the object is at rest"
+       },
+       "notes": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "name",
+       "trigger",
+       "entries"
+      ]
+     }
+    },
+    {
+     "type": "null"
+    }
+   ],
+   "description": "Frame-exact motion/animation timelines captured from the emulator; the reimplementation must reproduce them"
+  }
+ }
+}

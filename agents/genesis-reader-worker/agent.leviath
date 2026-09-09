@@ -1,0 +1,118 @@
+# Genesis Reader WORKER — traces one switchable PRG bank. Spawned by
+# genesis-reader's excavate_banks fan-out (worker_agent). Separate blueprint so
+# it can never continue into the parent's merge/spec stages.
+[agent]
+name = "genesis-reader-worker"
+version = "0.1.0"
+description = "Clean Room A worker: trace one PRG bank of a NES ROM into analysis/bank_NN.json"
+entry_stage = "work"
+
+[tool_permissions]
+read_file = "allow"
+read_files = "allow"
+list_dir = "allow"
+write_file = "allow"
+edit_file = "allow"
+shell = "deny"
+bash = "deny"
+web_search = "deny"
+web_fetch = "deny"
+
+[tool_script_permissions]
+shell = "allow"
+
+[compaction]
+provider = "openrouter"
+model = "openai/gpt-5.6-luna"
+
+[context.regions]
+task         = { kind = "pinned", budget = "20%", max_tokens = 40000, seed = "task", required = true, volatility = "stable", description = "The work item: bank, entry points, ROM structure, calling convention, RAM names" }
+trace        = { kind = "clearable", budget = "25%", max_tokens = 40000 }
+conversation = { kind = "sliding_window", max_items = 30, budget = "20%", max_tokens = 20000, strategy = "bulk", overflow = 15 }
+scratch      = { kind = "clearable", budget = "5%", max_tokens = 8000 }
+
+[stages.work]
+mode = "autonomous"
+description = "Trace one bank's code and data"
+model = { models = ["anthropic/claude-fable-5.1", "anthropic/claude-opus-5", "openai/gpt-5.6-sol"] }
+available_tools = ["rom_reach", "rom_disasm", "rom_xrefs", "rom_bytes", "rom_entropy", "rom_decode_try", "read_file", "write_file"]
+max_iterations = 90
+system_prompt = """
+You are tracing ONE switchable PRG bank of a NES ROM. Your work item (bank
+number, entry points, what callers expect, the ROM structure, the cross-bank
+calling convention, and the RAM variable names already chosen) is in your
+pinned context — it is all you get. The hardware reference is at
+reference/hardware_reference.md (read_file) if needed.
+
+Rules: describe WHAT code does, never how. No addresses, mnemonics, or byte
+values in any description. Reuse the RAM variable role names you were given.
+
+WORKFLOW — alternate reading and writing; tool output is compact text:
+1. rom_reach(bank=<yours>, entries=<your entry points>). Keep the subroutine
+   list as your worklist.
+2. Loop: rom_disasm(start, bank=<yours>, follow=true, count=120) for up to 4
+   routines, then in the NEXT turn append their entries to analysis/bank_<NN>.json
+   (write_file the whole file each time, two-digit bank). Never read more code
+   before the entries for the previous reads are written. Generic runtime
+   helpers get one combined entry.
+3. Classify unreached ranges in your bank with rom_entropy / rom_bytes /
+   rom_decode_try (try rle, pb53, lz on compressed-looking data).
+
+analysis/bank_<NN>.json shape:
+  {"bank": N,
+   "routines": [{"key": "N:XXXX", "name", "behavior", "inputs", "outputs",
+                 "constants", "calls", "callers", "hardware", "bank_switches"}],
+   "data": [{"key": "N:XXXX", "len", "kind", "format", "purpose", "decoder"}],
+   "ram_variables": [{"name", "meaning", "size"}],
+   "unresolved": ["<dynamic bank switch or unknown target, described>"],
+   "cross_bank_calls": [{"to_bank": M, "target": "M:XXXX", "why"}]}
+The "key"/"target" fields are the ONLY places addresses may appear.
+
+Finish with submit_output: a 10-20 line plain summary of what this bank
+contains (systems, data, unresolved items), no addresses.
+"""
+[stages.work.tool_routing]
+default_region = "conversation"
+max_result_tokens = 12000
+[stages.work.tool_routing.overrides]
+rom_disasm  = { region = "trace", max_result_tokens = 9000 }
+rom_reach   = { region = "trace", max_result_tokens = 10000 }
+rom_xrefs   = { region = "trace", max_result_tokens = 3000 }
+rom_bytes   = { region = "trace", max_result_tokens = 2500 }
+rom_entropy = { region = "trace", max_result_tokens = 2500 }
+
+[stages.work.transitions.done]
+hint = "Bank traced and analysis/bank_NN.json written"
+gate = { require_modifications = true }
+
+[stages.work.transitions.done_anyway]
+condition = "max_iterations"
+
+[stages.done]
+mode = "output"
+description = "Summarize the bank"
+model = { models = ["anthropic/claude-fable-5.1", "anthropic/claude-opus-5", "openai/gpt-5.6-sol"] }
+available_tools = []
+max_iterations = 2
+system_prompt = """
+Call submit_output NOW, in this turn, with the report. There are no other tools
+here and no second chance: a turn without submit_output fails the work item.
+After submit_output is accepted, do NOTHING else.
+"""
+[stages.done.output]
+format = "markdown"
+instructions = "10-20 plain lines: what this bank contains (systems, data, unresolved items), no addresses."
+
+[stages.done_anyway]
+mode = "output"
+description = "Ran out of iterations: report the state honestly"
+model = { models = ["anthropic/claude-fable-5.1", "anthropic/claude-opus-5", "openai/gpt-5.6-sol"] }
+available_tools = []
+max_iterations = 2
+system_prompt = """
+You ran out of iterations. Say what was traced and what remains. After
+submit_output is accepted, do NOTHING else.
+"""
+[stages.done_anyway.output]
+format = "markdown"
+instructions = "Honest status of the bank analysis."

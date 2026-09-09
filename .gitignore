@@ -1,0 +1,11 @@
+# Per-game working trees (ROM copies, extracted assets, agent workdirs, shots, logs) never ship with the agent
+workspace/
+# Never commit ROMs or extracted assets anywhere (BYOROM)
+*.nes
+*.fm2
+*.log
+# Rust
+target/
+# editor / tool state
+.claude/
+.DS_Store

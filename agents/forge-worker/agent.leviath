@@ -1,0 +1,92 @@
+# Forge WORKER — changes one module per the feature plan. Spawned by forge's
+# implement fan-out (worker_agent); separate blueprint so it cannot continue
+# into the parent's validate/publish stages.
+[agent]
+name = "forge-worker"
+version = "0.1.0"
+description = "Changes ONE module of a reimplementation per a feature plan excerpt"
+entry_stage = "work"
+
+[tool_permissions]
+read_file = "allow"
+read_files = "allow"
+list_dir = "allow"
+write_file = "allow"
+edit_file = "allow"
+shell = "allow"
+web_search = "deny"
+web_fetch = "deny"
+
+[sandbox]
+kind = "container"
+engine = "docker"
+image = "nes-decomp-cc65:latest"
+network = false
+
+[safe_commands]
+allow = ["make", "cc65", "ca65", "ld65", "gcc", "xxd", "ls", "cat", "wc", "diff"]
+
+[compaction]
+provider = "openrouter"
+model = "openai/gpt-5.6-luna"
+
+[context.regions]
+task         = { kind = "pinned", budget = "30%", max_tokens = 60000, seed = "task", required = true, volatility = "stable" }
+code         = { kind = "compacting", budget = "20%", max_tokens = 20000, compact_at = "80%" }
+build_output = { kind = "clearable", budget = "10%", max_tokens = 12000 }
+conversation = { kind = "sliding_window", max_items = 30, budget = "20%", max_tokens = 20000, strategy = "bulk", overflow = 15 }
+scratch      = { kind = "clearable", budget = "5%", max_tokens = 8000 }
+
+[stages.work]
+mode = "autonomous"
+description = "Change the module per the plan"
+model = { models = ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna"] }
+available_tools = ["read_file", "read_files", "list_dir", "write_file", "edit_file", "shell"]
+max_iterations = 50
+system_prompt = """
+Implement the plan excerpt for your module (work item in pinned context). Keep
+existing behavior intact unless the plan says it is behind a toggle. Add tests
+for the new behavior and keep the old tests passing. Run the compile and
+host_test commands until green. Only touch the files in your work item.
+submit_output: what changed, tests, any API additions.
+"""
+[stages.work.tool_routing]
+default_region = "conversation"
+[stages.work.tool_routing.overrides]
+shell      = { region = "build_output", max_result_tokens = 8000 }
+read_file  = { region = "code", max_result_tokens = 12000 }
+
+[stages.work.transitions.done]
+hint = "Change made and tested"
+gate = { require_modifications = true }
+
+[stages.work.transitions.done_anyway]
+condition = "max_iterations"
+
+[stages.done]
+mode = "output"
+description = "Report the change"
+model = { models = ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna"] }
+available_tools = []
+max_iterations = 2
+system_prompt = """
+Call submit_output NOW, in this turn, with the report. There are no other tools
+here and no second chance: a turn without submit_output fails the work item.
+After submit_output is accepted, do NOTHING else.
+"""
+[stages.done.output]
+format = "markdown"
+instructions = "What changed, tests, any API additions."
+
+[stages.done_anyway]
+mode = "output"
+description = "Ran out of iterations"
+model = { models = ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna"] }
+available_tools = []
+max_iterations = 2
+system_prompt = """
+Report the honest state. After submit_output is accepted, do NOTHING else.
+"""
+[stages.done_anyway.output]
+format = "markdown"
+instructions = "Honest status."

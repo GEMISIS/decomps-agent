@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://leviath.dev/schemas/nes-decomp/remedy_report.schema.json",
+  "title": "Remedy Report",
+  "description": "Final output of a Remedy run: what the issue was, what was changed, and where the PR is.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["issue_number", "classification", "root_cause", "files_changed", "tests_added", "spec_changed", "summary"],
+  "properties": {
+    "issue_number": { "type": "integer", "minimum": 1 },
+    "classification": { "type": "string", "enum": ["spec_gap", "code_bug", "test_harness", "invalid"] },
+    "root_cause": { "type": "string", "minLength": 20 },
+    "files_changed": { "type": "array", "items": { "type": "string" } },
+    "tests_added": { "type": "array", "items": { "type": "string" } },
+    "spec_changed": { "type": "boolean" },
+    "spec_sections_changed": { "type": "array", "items": { "type": "string" } },
+    "pr_url": { "type": "string", "pattern": "^https://" },
+    "branch": { "type": "string" },
+    "build_ok": { "type": "boolean" },
+    "tests_ok": { "type": "boolean" },
+    "summary": { "type": "string", "minLength": 20 },
+    "follow_ups": { "type": "array", "items": { "type": "string" } }
+  }
+}

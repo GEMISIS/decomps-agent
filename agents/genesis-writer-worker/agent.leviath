@@ -1,0 +1,150 @@
+# Genesis Writer WORKER — one module per run. Spawned by genesis-writer's
+# synthesize fan-out (worker_agent). A separate blueprint so a worker can never
+# continue into the parent's integrate/verify/publish stages (an internal
+# worker_stage does exactly that and multiplied costs by ~10x).
+[agent]
+name = "genesis-writer-worker"
+version = "0.1.0"
+description = "Implements ONE module of a clean-room NES reimplementation from its work item (spec excerpt + header)"
+entry_stage = "work"
+
+[tool_permissions]
+read_file = "allow"
+read_files = "allow"
+list_dir = "allow"
+write_file = "allow"
+edit_file = "allow"
+shell = "allow"
+web_search = "deny"
+web_fetch = "deny"
+
+[sandbox]
+kind = "container"
+engine = "docker"
+image = "nes-decomp-cc65:latest"
+network = false
+
+[safe_commands]
+allow = ["make", "cc65", "ca65", "ld65", "cl65", "gcc", "xxd", "ls", "cat", "wc", "python3", "diff", "sh"]
+
+[compaction]
+provider = "openrouter"
+model = "openai/gpt-5.6-luna"
+
+[context.regions]
+task         = { kind = "pinned", budget = "30%", max_tokens = 60000, seed = "task", required = true, volatility = "stable", description = "The work item: module, files, header, spec excerpt, conventions, commands" }
+code         = { kind = "compacting", budget = "20%", max_tokens = 20000, compact_at = "80%" }
+build_output = { kind = "clearable", budget = "10%", max_tokens = 12000 }
+conversation = { kind = "sliding_window", max_items = 30, budget = "20%", max_tokens = 20000, strategy = "bulk", overflow = 15 }
+scratch      = { kind = "clearable", budget = "5%", max_tokens = 8000 }
+
+[stages.work]
+mode = "autonomous"
+description = "Implement the module, compile it, run its host test"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file", "read_files", "list_dir", "write_file", "edit_file", "shell"]
+max_iterations = 35
+system_prompt = """
+Implement ONE module of a NES game in C89 for cc65. Your work item (module,
+file paths, the spec system and timeline NAMES you own, compile and test
+commands) is in your pinned context. Everything else you read yourself from
+the shared working directory, in this order, before writing code:
+  1. include/<your header> and every header in `other_headers` (the contract).
+  2. spec/behavioral_spec.json — the `systems` entries named in
+     `spec_systems`, the `timelines` named in `spec_timelines`, the
+     `ram_variables` they mention, `video` and `acceptance_observations` if
+     your module draws or moves anything, `sound_engine` if it is audio.
+     Read it with read_file; it is large, so read it once and keep notes.
+  3. reference/c_conventions.md sections 2, 5, 7, 8, 11, 12 and the
+     "Frame-exact behaviour" / "Per-frame CPU budget" sections.
+Do not read other modules' .c files.
+
+Rules:
+- Implement exactly the behavior and constants in the spec excerpt. Where the
+  spec is silent, choose the simplest reasonable behavior and add a
+  `/* SPEC-GAP: ... */` comment so it can be raised as an issue later.
+- If the excerpt carries `timelines` (frame-exact positions, attribute
+  animation cycles, pause lengths, lag frames), reproduce them exactly: the
+  object appears on the same frame relative to the input, at the same
+  pixel, and cycles its attribute bytes with the same period and phase. A
+  reset/spawn reloads EVERY variable the excerpt lists (direction flags and
+  animation counters included), not just positions.
+- NEVER leave a stub: no `TODO`, no empty function bodies for spec'd behavior,
+  no "state + init only" modules. An audio driver must actually parse the
+  song data and write the sound registers every frame; a renderer must
+  actually draw the spec'd screens from the assets. A module that is not
+  fully implemented is treated as failed by the integrate stage.
+- Keep the header's API unchanged (other modules depend on it). If you must add
+  a declaration, add it and say so in your output.
+- Follow the conventions: no floats, no recursion, statics over locals in hot
+  paths, fixed-width types, hardware only via nes.h, host-testable logic under
+  #ifndef NES_HOST_TEST guards where it touches hardware.
+- Write real tests in the test file for the constants and behaviors in the
+  excerpt (e.g. gravity applied per frame, velocity caps, decoder round trips).
+  If your module walks data (audio driver, decoder, strip/tilemap reader),
+  the test MUST include the fuzz-termination test from c_conventions
+  "Bounded data walkers": random bytes, 2,000 ticks, every tick returns
+  within the cap. Stub assets are zeros, so only this test catches the
+  real-data infinite loop that freezes the game.
+- Run the `compile` command until it succeeds, then the `host_test` command
+  until it passes. Do not claim success you have not run.
+- include/nes.h, src/nes_hw.c, include/vram_queue.h, src/vram_queue.c,
+  src/nmi_shim.s, src/vram_copy.s and test/hw_nes_stub.c are fixed
+  board-support files: never edit them and
+  never redefine anything they define (oam_shadow_buffer, nmi_flag,
+  hw_apu_frame ...).
+- Only edit your source file and your test file. NEVER edit a header: the
+  header in your work item is the contract every other module was written
+  against. If you truly need a new declaration, say so in your output.
+- Budget: you have 35 turns. Compile early, test early, and finish with a
+  working module rather than a perfect one; report what is missing.
+- Do NOT read other modules' .c files "to understand the dispatch order" or
+  "to confirm defaults": the headers and the spec are the whole contract.
+
+submit_output: 5-15 lines — what you implemented, tests passing, any header
+additions, any SPEC-GAP comments.
+"""
+[stages.work.tool_routing]
+default_region = "conversation"
+[stages.work.tool_routing.overrides]
+shell      = { region = "build_output", max_result_tokens = 8000 }
+read_file  = { region = "code", max_result_tokens = 12000 }
+read_files = { region = "code", max_result_tokens = 16000 }
+
+[stages.work.transitions.done]
+hint = "Module implemented, compiled and tested"
+gate = { require_modifications = true }
+
+[stages.work.transitions.done_anyway]
+condition = "max_iterations"
+
+[stages.done]
+mode = "output"
+description = "Report what was implemented"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = []
+max_iterations = 2
+system_prompt = """
+Call submit_output NOW, in this turn, with the report. There are no other tools
+here and no second chance: a turn without submit_output fails the work item.
+After submit_output is accepted, do NOTHING else.
+"""
+[stages.done.output]
+format = "markdown"
+instructions = "5-15 lines: what you implemented, which tests pass, any header additions, any SPEC-GAP comments, and anything left unfinished (say so explicitly)."
+
+[stages.done_anyway]
+mode = "output"
+description = "Ran out of iterations: report the state honestly"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = []
+max_iterations = 2
+system_prompt = """
+You ran out of iterations. Call submit_output NOW, in this turn: report exactly
+what is implemented, what compiles, what is missing (from memory - there are no
+other tools here). A turn without submit_output fails the work item.
+After submit_output is accepted, do NOTHING else.
+"""
+[stages.done_anyway.output]
+format = "markdown"
+instructions = "Honest status: implemented / compiles? / tests? / missing."

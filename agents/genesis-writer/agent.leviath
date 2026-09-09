@@ -1,0 +1,458 @@
+# Genesis Writer — Clean Room B
+#
+# Turns a behavioral spec into a cc65 C project that builds to a NES ROM.
+# This run never sees the ROM: its workdir holds only spec/behavioral_spec.json
+# and the reference material, it has no rom_* tools and no [read_paths], and
+# every shell command runs inside a container that has a C toolchain and
+# nothing else. scripts/handoff.sh is the only thing that puts files here.
+
+[agent]
+name = "genesis-writer"
+version = "0.1.0"
+description = "Clean Room B: behavioral spec → cc65 C source that builds to a NES ROM (never sees the ROM)"
+entry_stage = "architecture"
+
+[tool_permissions]
+read_file  = "allow"
+read_files = "allow"
+list_dir   = "allow"
+write_file = "allow"
+edit_file  = "allow"
+shell      = "allow"
+web_search = "deny"
+web_fetch  = "deny"
+
+# Every shell command runs in this container (built by scripts/setup.sh from
+# docker/cc65.Dockerfile). The ROM is not mounted; only the workdir is.
+[sandbox]
+kind    = "container"
+engine  = "docker"
+image   = "nes-decomp-cc65:latest"
+network = false
+
+[safe_commands]
+allow = ["make", "cc65", "ca65", "ld65", "cl65", "gcc", "xxd", "ls", "cat", "wc", "python3", "diff", "sh"]
+
+[compaction]
+provider = "openrouter"
+model = "openai/gpt-5.6-luna"
+
+# ─── Context layout ──────────────────────────────────────────────────────────
+[context.regions]
+task            = { kind = "pinned", budget = "2%", max_tokens = 3000, seed = "task", required = true, required_message = "Give the game a short name via --task." }
+behavioral_spec = { kind = "pinned", budget = "25%", max_tokens = 70000, seed = { files = ["spec/behavioral_spec.json"] }, volatility = "stable", summarizable = false, required = true, required_message = "spec/behavioral_spec.json is missing from the workdir. Run scripts/handoff.sh first.", description = "The behavioral spec — the only knowledge of the game this run has" }
+c_conventions   = { kind = "pinned", budget = "10%", max_tokens = 20000, seed = { files = ["reference/c_conventions.md"] }, volatility = "stable", description = "cc65 / NES coding conventions and build rules" }
+project_plan    = { kind = "pinned", budget = "5%", max_tokens = 10000, description = "Module list, file layout, bank placement, build commands" }
+interfaces      = { kind = "pinned", budget = "8%", max_tokens = 16000, description = "Public API of every header, verbatim" }
+todos            = { kind = "checklist", budget = "3%", max_tokens = 6000, description = "Modules to implement / fix" }
+build_output    = { kind = "clearable", budget = "10%", max_tokens = 10000, description = "Compiler and test output" }
+conversation    = { kind = "sliding_window", max_items = 30, budget = "16%", max_tokens = 20000, strategy = "bulk", overflow = 15 }
+scratch         = { kind = "clearable", budget = "5%", max_tokens = 8000 }
+
+# ─── Stage 1: Architecture ───────────────────────────────────────────────────
+[stages.architecture]
+mode = "autonomous"
+description = "Design the project: headers, build system, stubs that link"
+model = { models = ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna"] }
+available_tools = ["read_file", "read_files", "list_dir", "write_file", "edit_file", "shell", "context_write", "context_read", "todo_add"]
+max_iterations = 75
+max_revisits = 2
+system_prompt = """
+You are the architect of a from-scratch C reimplementation of the game described
+in `behavioral_spec`. You have never seen the original program and must not
+guess at its internals; implement the described behavior in clean, portable C89
+for cc65, following `c_conventions`.
+
+RESUMED RUN: if the working directory already holds a Makefile, src/ and
+include/ from an earlier attempt, do not recreate them — run `make stub-assets
+&& make`, fix only what fails to link, then do steps 2 and 4 below (plan,
+todo items, interfaces) and finish. In a resumed run todo_add ONLY the
+modules that still need work: a src/*.c that contains "TODO" or "STUB", or
+that fails to compile. Modules a previous attempt completed are not
+re-queued (that would pay the workers twice); integrate and verify will
+catch anything wrong in them.
+
+ORDER OF WORK (the stage has a turn cap; do the bookkeeping FIRST so a cap
+can never lose it):
+ 1. Read the spec and asset_files.json; decide the module list.
+ 2. context_write `project_plan` (module list, file map, build commands) and
+    todo_add ONE ITEM PER MODULE immediately — the fan-out dispatches open
+    todo items; a stage that ends without them dispatches nothing.
+ 3. Copy the fixed files, write nes.cfg, the headers, include/assets.h and
+    src/assets.s, the Makefile, main.c and the stub .c files.
+ 4. context_write `interfaces` (every header verbatim).
+ 5. `make stub-assets && make` until it links. Do NOT write per-module test
+    files or tests beyond test/runner.c and test/hw_stub.c — workers write
+    their own tests.
+
+PROJECT ROOT = the working directory itself: Makefile, nes.cfg, include/, src/,
+test/, assets/ live directly there. Never create a subfolder named after the
+game; workers and the build scripts assume the root layout.
+
+Deliver a tree that BUILDS AND LINKS before any real logic exists:
+- FIXED FILES (copy verbatim with `cp`, never write your own version, never
+  edit them, and tell workers they are read-only):
+    reference/linker/<mapper>.cfg → nes.cfg   (adjust PRG/CHR counts and
+                                                mirroring to the spec's `game`)
+    reference/nmi_shim.s          → src/nmi_shim.s
+    reference/vram_copy.s         → src/vram_copy.s
+    reference/nes.h               → include/nes.h
+    reference/nes_hw.c            → src/nes_hw.c
+    reference/hw_nes_stub.c       → test/hw_nes_stub.c
+    reference/vram_queue.h        → include/vram_queue.h
+    reference/vram_queue.c        → src/vram_queue.c   (compiles on the host too; link it into tests)
+  They are the board-support layer: boot, NMI, vblank wait, VRAM/OAM/APU
+  access, controller read, mapper registers, and the VRAM update queue
+  (vram_queue_add / add_column / add_fill / flush / pending). Do NOT design
+  another queue or another way to write VRAM while rendering is on: logic
+  calls vram_queue_add, nmi_handler calls vram_queue_flush first, whole
+  screens are drawn with rendering off via hw_vram_copy / hw_vram_fill. Every game uses the same one;
+  the Makefile passes -DNES_MAPPER=<mapper_number> to cc65 and gcc. A
+  hardware role that nes.h lacks goes in src/nes_hw_extra.c (rare). Put
+  the full text of include/nes.h into `interfaces` so every worker uses
+  exactly these functions and the `oam_shadow_buffer` page. If the
+  spec's sound_engine grammar is the FamiTone2 format (five channel streams,
+  instrument envelopes, tempo accumulator, effect streams — see
+  reference/audio/README.md), start audio.c from
+  reference/audio/famitone2_player.c instead of writing a driver from scratch.
+- include/: assets.h (assets by ID from the spec's `assets`), game.h (state types from `ram_variables`, the state enum
+  from `state_machine`, and `extern` declarations of EVERY shared RAM
+  variable — defined once in src/game_state.c, which you write now; workers
+  never define shared variables), and one header per module you define.
+- src/: assets.c + a generated src/assets.s that .incbin's the extracted asset files
+  into the segments named in nes.cfg — file names and byte sizes are FIXED by
+  the extractor and listed in spec/asset_files.json (read it first; use
+  those paths verbatim in assets.s and in `stub-assets`; a tilemap is
+  assets/<id>.nam, a palette assets/<id>.pal, a pattern table assets/<id>.chr,
+  everything else assets/<id>.bin — a wrong extension makes the real build
+  link a zero-filled stub instead of the extracted data), main.c (init + game loop + state
+  dispatch), and a STUB .c for every module in your plan (functions present,
+  bodies empty or trivial) so the tree links now.
+- Makefile: targets `all` (cc65 → build/game.nes), `stub-assets` (creates
+  zero-filled assets/<id>.<ext> files with those exact names, sized from the
+  spec: tile_count*16 for pattern tables, byte_count otherwise, 32 for palettes
+  unless byte_count given),
+  `test` (gcc -std=c89 -Wall -Wextra -Werror -Wimplicit-function-declaration
+  -DNES_HOST_TEST test/hw_nes_stub.c src/vram_queue.c test/hw_stub.c
+  test/*.c + the pure-logic modules → runs them; -Werror is mandatory so the
+  suite also builds under clang on the user's machine;
+  test/hw_stub.c holds only the project-specific doubles such as asset
+  arrays),
+  `clean`. `all` must depend on the assets existing.
+- test/: a tiny host test runner (test/runner.c) plus test/hw_stub.c for
+  project-specific doubles (asset arrays). Workers add test_<module>.c.
+- Boot must reproduce the spec's `video` section exactly: upload every
+  initial palette USING THE LITERAL COLOR VALUES FROM THE SPEC (a const table
+  in C — never depend on an extracted asset for the boot palette; extracted
+  bytes may be raw table data the original transforms), draw the initial screen, set the PPU control/mask as
+  described, before enabling rendering. If `video` is missing, treat it as a
+  spec gap: pick black background / white text and add a SPEC-GAP comment.
+- Read `acceptance_observations` and `timelines` in the spec: they are the
+  acceptance tests the verify stage will run on the real build (screens at
+  given frames, HUD text, sound register cadence, frame-exact sprite motion
+  and animation). Plan modules and tests so they can pass; put every
+  timeline into the work item of the module that owns that object.
+- Modules: choose them from the spec's `systems` (input, physics, collision,
+  camera, renderer/vram queue, sprites, entities/AI, levels + runtime decoders
+  from `runtime_formats`, hud, audio driver from `sound_engine`, game_state,
+  rng). Keep hardware-independent logic in modules that compile on the host.
+- Banked mappers: assign each module a bank via #pragma code-name/rodata-name
+  per `c_conventions`, keep main/nes_hw/audio/bank helpers in the fixed bank.
+
+Run `make stub-assets && make` (shell) until it links. `interfaces`
+(context_write) must hold every header's declarations verbatim; `project_plan`
+and the todo items were written in step 2 — update them if the module list
+changed.
+"""
+[stages.architecture.tool_routing]
+default_region = "conversation"
+[stages.architecture.tool_routing.overrides]
+shell      = { region = "build_output", max_result_tokens = 8000 }
+read_file  = { region = "scratch", max_result_tokens = 12000 }
+read_files = { region = "scratch", max_result_tokens = 16000 }
+
+[stages.architecture.transitions.synthesize]
+hint = "Skeleton builds and links; headers and plan written"
+transform = "compact"
+gate = { require_regions = ["project_plan", "interfaces"], require_region_updated = "todos", require_modifications = true, message = "todo_add one item per module that still needs its real implementation - the fan-out dispatches OPEN todo items and nothing else (a run went to integrate with zero workers when this was skipped)." }
+
+[stages.architecture.transitions.recover]
+condition = "error"
+
+# ─── Stage 2: Synthesize (fan-out per module) ────────────────────────────────
+[stages.synthesize]
+mode = "fan_out"
+description = "Implement each module in parallel"
+model = { models = ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna"] }
+worker_agent = "genesis-writer-worker"
+merge_stage = "integrate"
+max_workers = 6
+on_worker_failure = "continue"
+max_attempts = 3
+split_prompt = """
+Read the `todos` region (open items are modules to implement) and
+`project_plan`. If `todos` has NO open items, derive the module list from
+`project_plan` (the architecture stage may have hit its turn cap) — never
+emit an empty array while stub modules exist. Output ONLY a JSON array: the very
+first character of your reply is '[' and the very last is ']'. NO markdown
+code fence (no ```), no "json" label, no prose before or after — a fenced
+reply parses as zero items and the whole fan-out is skipped. Items are SMALL: the worker
+reads the header, the spec and the conventions from the shared working
+directory itself, so do not paste file contents. One item per module: THIS IS YOUR ONLY TURN AND YOU HAVE NO TOOLS: do not emit an
+"inspect", "read" or "survey" item to gather information first (a run lost its
+whole worker round to one such item) — the regions in this prompt are all the
+information there is; produce the final array of real work items now.
+
+[{"id": "physics",
+  "context": {
+    "module": "physics",
+    "source_file": "src/physics.c",
+    "header_file": "include/physics.h",
+    "test_file": "test/test_physics.c",
+    "spec_systems": ["object_physics", "scoring"],
+    "spec_timelines": ["spawn_sequence", "first_collision"],
+    "other_headers": ["include/game.h", "include/sprites.h", "include/audio.h"],
+    "bank": "fixed",
+    "compile": "cc65 -t nes -O -Oirs -I include -DNES_MAPPER=0 -o build/physics.s src/physics.c",
+    "host_test": "gcc -std=c89 -DNES_HOST_TEST -I include test/runner.c test/hw_nes_stub.c test/hw_stub.c src/vram_queue.c test/test_physics.c src/physics.c -o build/test_physics && ./build/test_physics",
+    "notes": "<one or two lines: what this module owns, which timelines it must reproduce>"
+  }}]
+
+`spec_systems` / `spec_timelines` are the exact `name` values from
+spec/behavioral_spec.json that this module implements or must reproduce.
+Emit EXACTLY the open todo items — one item per open todo, nothing extra
+(a module that has no open item is done; re-dispatching it pays a worker
+for nothing). The project_plan fallback applies ONLY when `todos` has no
+open items at all. If no module needs work, output exactly: []
+"""
+
+[stages.integrate]
+mode = "autonomous"
+description = "Full build, resolve interface mismatches, run all tests"
+# at most two synthesize rounds: a third almost always means the design, not the modules, is wrong
+model = { models = ["anthropic/claude-fable-5.1", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file", "read_files", "list_dir", "write_file", "edit_file", "shell", "context_read", "context_write", "todo_done", "todo_note", "todo_add", "build_check", "build_hosttests", "build_profile", "build_ramlog", "build_observe", "build_apu_trace", "build_oamlog"]
+max_iterations = 45
+max_revisits = 4   # integrate ⇄ synthesize/verify fix loops: quality over cost (user, 2026-09-05)
+system_prompt = """
+The module workers' reports are in your conversation. Integrate their work
+(temp files go under build/, never /tmp — writes outside the workdir are denied):
+0. STUB GATE: `grep -n "TODO\\|stub\\|not implemented" src/*.c`. Any module that
+   still has a TODO/stub for spec'd behavior stays OPEN (todo_note it with
+   what is missing) so the next synthesize round re-dispatches it. Do not
+   accept a build that links only because a module is empty.
+1. `make` (full cc65 build). Fix link errors, duplicate symbols, header drift
+   between modules by fixing CALLERS to match `interfaces`. Do NOT rewrite
+   headers or the game-state model: workers were written against them and a
+   second round would diverge. Only add missing declarations.
+2. build_hosttests (host tests with the strict flags the user's machine applies;
+   plain `make test` is NOT enough). Fix harness problems here; if a module's LOGIC is
+   wrong, todo_note the item with the failure and leave it open so the next
+   synthesize round re-dispatches only that module.
+3. todo_done every module whose code compiles and whose tests pass.
+4. Check for `SPEC-GAP` comments and list them in SPEC_GAPS.md.
+5. RUN THE BUILD: first build_check (frames 120): its SUMMARY must be ALL PASS
+   (palette literals, something drawn, boot reached the palette upload) —
+   a FAIL there is a bug in YOUR code, fix it before anything else.
+   Then build_observe (frames 120) must show the spec's
+   `video.initial_screen` (non-blank tile rows where the spec says there is
+   content, palette equal to `video.initial_palettes`); if the spec has a
+   `sound_engine`, build_apu_trace (frames 0-120) must show sound register
+   writes every frame once music starts.
+   WHAT STUB ASSETS DO AND DO NOT EXCUSE: in this sandbox every assets/ file
+   is zero-filled, so tile GRAPHICS are blank squares and music/sfx DATA is
+   silent. Everything else is yours and must be right regardless:
+   - the palette in PPU RAM must equal the spec's literal palette values
+     (an all-zero palette is a bug in the palette upload, never "expected");
+   - nametable rows the spec describes must contain the tile numbers the
+     spec gives (text rows use the character-to-tile mapping in the spec,
+     borders/HUD use the tile numbers it lists) at the row/column it gives —
+     a tilemap asset draws as zeros, but text and HUD written from constants
+     do not;
+   - sprite count, slots, positions and the `timelines` must match exactly;
+   - state transitions must happen on the spec'd frame after the input;
+   - the sound driver must still write the register set the spec names on
+     the frames it names (init, per-frame image) even though the data is
+     zero.
+   Never write "expected because assets are stubs" for any of those.
+   Use build_observe's "NT0 ROWS WRITTEN" line to confirm every block the
+   spec says the screen contains was actually written to the rows it names
+   (a missing logo shows up as missing rows, whatever the tile values). Compare against every entry in
+   `acceptance_observations` you can reach (press the button the spec names),
+   and run build_oamlog over each `timelines` entry's frame range: the
+   object must appear on the same frame, at the same x/y, with the same
+   attribute cycle. A screen whose later rows are garbled, or a text row
+   whose tail restarts at its own first column, means the vblank budget was
+   exceeded (c_conventions "Vblank budget") — that is a renderer bug, not a
+   data bug. Anything that does not match → todo_note the responsible module
+   and leave it open.
+Then choose: if you re-opened module items (todo_add/todo_note) → synthesize;
+otherwise → verify. Do not re-read files you have already read. Split the
+work by kind: INTEGRATION problems — link errors, duplicate symbols, a
+Makefile source list, a missing declaration, two modules owning the same
+variable — you fix HERE, in place, right now (a worker round for a Makefile
+edit costs $5 and a stage visit). MODULE LOGIC problems — a system that does
+not do what the spec says, a timeline mismatch inside one module — you
+re-open (todo_add with the exact failing check) and let a worker do it.
+Every iteration here costs a full 60k-token prompt.
+"""
+[stages.integrate.tool_routing]
+default_region = "conversation"
+[stages.integrate.tool_routing.overrides]
+build_check     = { region = "build_output", max_result_tokens = 3000 }
+build_profile   = { region = "build_output", max_result_tokens = 3000 }
+build_ramlog    = { region = "build_output", max_result_tokens = 3000 }
+shell      = { region = "build_output", max_result_tokens = 10000 }
+build_observe   = { region = "build_output", max_result_tokens = 6000 }
+build_apu_trace = { region = "build_output", max_result_tokens = 4000 }
+build_oamlog    = { region = "build_output", max_result_tokens = 5000 }
+read_file  = { region = "scratch", max_result_tokens = 12000 }
+read_files = { region = "scratch", max_result_tokens = 16000 }
+
+# Structural guard (2026-09-04: a run looped integrate → synthesize → integrate
+# three times with NO open items, $23 in one stage): going back to synthesize
+# is only possible if this visit re-opened or annotated a todo item.
+[stages.integrate.transitions.synthesize]
+hint = "Some modules still fail; re-dispatch the open ones"
+transform = "compact"
+gate = { require_region_updated = "todos", message = "Nothing was re-opened (todo_add / todo_note) in this visit, so there is nothing for synthesize to do — go to verify instead." }
+
+[stages.integrate.transitions.verify]
+hint = "Everything builds and all module tests pass"
+transform = "compact"
+gate = { require_no_open_items = "todos", message = "Every module item must be todo_done (or re-dispatched) before verification." }
+
+[stages.integrate.transitions.recover]
+condition = "stuck"
+stuck_after_iterations = 60
+stuck_after_same_file_edits = 8
+
+# ─── Stage 4: Verify ─────────────────────────────────────────────────────────
+[stages.verify]
+mode = "autonomous"
+description = "Clean build, ROM sanity checks, full tests, report"
+model = { models = ["anthropic/claude-fable-5.1", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file", "list_dir", "write_file", "shell", "context_read", "build_check", "build_hosttests", "build_profile", "build_ramlog", "build_observe", "build_apu_trace", "build_oamlog"]
+max_iterations = 30
+max_revisits = 4
+system_prompt = """
+Verify from a clean state (temp files go under build/, never /tmp — writes
+outside the workdir are denied):
+1. `make clean && make stub-assets && make` — must produce build/game.nes.
+   Assets are zero-filled here: tile graphics blank and music data silent are
+   the ONLY things that excuses. Palette values, text/HUD tile numbers and
+   positions, sprite slots/positions, timelines, transition frames and the
+   sound driver's register cadence all come from the spec and must match.
+2. Check the ROM: size = 16 + PRG + CHR bytes for the spec's bank counts;
+   first four bytes are the iNES magic (`xxd -l 16 build/game.nes`); the
+   mapper nibble matches the spec.
+3. build_hosttests — every test binary PASS and "HOSTTESTS: N pass, 0 fail";
+   a test file that is not wired into the Makefile's test target counts as a
+   failure. Paste the summary line into the report.
+4. Count `SPEC-GAP` comments; `grep -c TODO src/*.c` must be 0.
+5. BEHAVIOR ON THE REAL BUILD (this is the acceptance test):
+   - build_check (frames 120) must print SUMMARY: ALL PASS; paste its lines
+     into the report. BUILD: OK is impossible without it.
+   - build_observe prints a "PPU CTRL=" line (background/sprite pattern table,
+     sprite size, nametable): it must match the spec's `video.ppu_settings`
+     for that screen — the right tile ids from the wrong pattern table draw
+     font glyphs instead of the logo, and no row check catches it.
+   - build_observe prints "NT0 ROWS WRITTEN (row:bytes)": compare it with the
+     rows the spec's `video.initial_screen` / acceptance observations say are
+     drawn (a logo on rows 4-13 means rows 4-13 each show ~20 bytes; a text
+     line means ONE row with N bytes, not N rows with 1 byte — the latter is
+     the +32 increment mode left on). Stub assets change the tile values,
+     never the rows written.
+   - build_observe at the frame the spec's `acceptance_observations` name
+     (and 120 by default): the screen must match `video.initial_screen`
+     (content rows, text, palette values).
+   - press the button the spec's state machine names to leave the first
+     state (e.g. start at frame 500, observe at 700+): the spec'd next screen
+     must appear, and every `acceptance_observations` entry with a frame
+     number must hold (HUD text, sprite counts, score progression).
+   - if the spec has a sound_engine: build_apu_trace must show writes to the
+     sound registers every frame while music plays, and the register set the
+     spec names for a sound effect when the event happens; and if it has
+     `register_trace_head`, the first 16 frames of each music start and the
+     first 8 of each effect must match it write for write (register role,
+     value, order) — quote the first mismatch and fix the driver; a driver
+     that "plays something" but not this table is NOT OK.
+   - if the spec has a random_number_generator system: build_ramlog on its
+     state variable(s) over the frames of `first_values` must reproduce that
+     list exactly; every call site must call it the stated number of times
+     per frame in the stated order (an extra or missing call shifts every
+     later random choice).
+   - for every `timelines` entry: build_oamlog over its frame range (same
+     press/press_at) must reproduce the frame the object appears, its x/y on
+     each listed frame and its attribute cycle. A one-frame lag or a 2-pixel
+     offset is a FAIL — say which frame and which value differ. A position
+     that REPEATS every few frames (advance, advance, repeat) is a lag frame:
+     the per-frame logic plus the NMI exceed one frame. Run build_profile over
+     that range, name the routine over budget, and fix or re-open it — do not
+     reason about it from the source. If build_profile shows hw_wait_vblank
+     taking most of the frame, the CPU is idle and it is NOT a lag frame:
+     use build_ramlog on the position variable and the state flag over the
+     same frames — if the variable advances every frame while the sprite
+     record stalls, the sprite builder is wrong; if the variable stalls, the
+     logic skipped that update (a counter, a flag, a state check).
+   Record each check as PASS/FAIL with the observed vs expected values.
+Write BUILD_REPORT.md with sections: `## Build` (must contain a line
+`BUILD: OK` or `BUILD: FAIL <reason>` and a line `ROM: build/game.nes`),
+`## Tests` (totals), `## Behavior` (each acceptance check PASS/FAIL with
+observed vs expected), `## Spec gaps` (list), `## Modules` (one line each).
+BUILD: OK is only allowed when every behavior check passes.
+If the build or tests fail, go back to synthesize with todo items re-opened
+(you cannot edit todo here — describe the failing modules in the report and
+choose synthesize). Otherwise go to publish.
+"""
+[stages.verify.tool_routing]
+default_region = "conversation"
+[stages.verify.tool_routing.overrides]
+build_check     = { region = "build_output", max_result_tokens = 3000 }
+build_profile   = { region = "build_output", max_result_tokens = 3000 }
+build_ramlog    = { region = "build_output", max_result_tokens = 3000 }
+shell = { region = "build_output", max_result_tokens = 8000 }
+build_observe   = { region = "build_output", max_result_tokens = 6000 }
+build_apu_trace = { region = "build_output", max_result_tokens = 4000 }
+build_oamlog    = { region = "build_output", max_result_tokens = 5000 }
+
+[stages.verify.transitions.publish]
+hint = "Build OK and tests pass"
+transform = "direct"
+
+[stages.verify.transitions.integrate]
+hint = "Build or tests fail; go back and fix"
+transform = "compact"
+
+[stages.verify.transitions.recover]
+condition = "error"
+
+# ─── Stage 5: Publish ────────────────────────────────────────────────────────
+[stages.publish]
+mode = "output"
+description = "Hand back the build report"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file"]
+max_iterations = 3
+[stages.publish.output]
+format = "markdown"
+validator = "validators/report.rhai"
+instructions = "Submit the contents of BUILD_REPORT.md unchanged."
+
+# ─── Recovery ────────────────────────────────────────────────────────────────
+[stages.recover]
+mode = "output"
+description = "Explain what went wrong"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["context_read"]
+max_iterations = 3
+system_prompt = """
+After submit_output is accepted, do NOTHING else: no more tool calls, no
+further text. One accepted submission ends the run.
+A stage failed or got stuck. Submit a short recovery report as the output:
+which stage, what was being attempted, the last errors, and what a human
+should check.
+"""
+[stages.recover.output]
+format = "markdown"
+instructions = "The recovery report: which stage failed, why, and what to check."

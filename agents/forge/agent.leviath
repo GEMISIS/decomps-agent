@@ -1,0 +1,189 @@
+# Forge — adds a feature to a clean-room reimplementation without breaking
+# the spec'd behavior. Writer-side rules: no ROM, no rom_* tools, container shell.
+
+[agent]
+name = "forge"
+version = "0.1.0"
+description = "Survey → plan → implement (fan-out per module) → validate a new feature on a reimplemented NES game"
+entry_stage = "survey"
+
+[tool_permissions]
+read_file  = "allow"
+read_files = "allow"
+list_dir   = "allow"
+write_file = "allow"
+edit_file  = "allow"
+shell      = "allow"
+web_search = "deny"
+web_fetch  = "deny"
+
+[sandbox]
+kind    = "container"
+engine  = "docker"
+image   = "nes-decomp-cc65:latest"
+network = false
+
+# LOCAL ONLY: commits land on a local branch; no push, no gh.
+[safe_commands]
+allow = ["make", "cc65", "ca65", "ld65", "gcc", "xxd", "ls", "cat", "wc", "diff", "git status", "git diff", "git log", "git add", "git commit", "git checkout", "git switch", "git branch"]
+
+[compaction]
+provider = "openrouter"
+model = "openai/gpt-5.6-luna"
+
+[context.regions]
+task            = { kind = "pinned", budget = "3%", max_tokens = 4000, seed = "task", required = true, required_message = "Describe the feature via --task (e.g. 'remappable controls with an options screen')." }
+behavioral_spec = { kind = "pinned", budget = "22%", max_tokens = 60000, seed = { files = ["spec/behavioral_spec.json"] }, volatility = "stable", summarizable = false, description = "Original behavior that must be preserved" }
+repo_files      = { kind = "pinned", budget = "3%", max_tokens = 5000, seed = { command = "git ls-files" } }
+c_conventions   = { kind = "pinned", budget = "8%", max_tokens = 20000, seed = { files = ["reference/c_conventions.md"] }, volatility = "stable", description = "cc65 / NES coding conventions, vblank budget, frame-exact rules" }
+codebase_map    = { kind = "pinned", budget = "8%", max_tokens = 16000, required = true, required_message = "Write `codebase_map` before leaving survey.", description = "Modules, public APIs, data flow" }
+feature_plan    = { kind = "pinned", budget = "6%", max_tokens = 12000, description = "Design: touched modules, new APIs, data, tests" }
+todos            = { kind = "checklist", budget = "3%", max_tokens = 6000 }
+build_output    = { kind = "clearable", budget = "10%", max_tokens = 10000 }
+code            = { kind = "compacting", budget = "15%", max_tokens = 30000, compact_at = "80%" }
+conversation    = { kind = "sliding_window", max_items = 30, budget = "16%", max_tokens = 20000, strategy = "bulk", overflow = 15 }
+scratch         = { kind = "clearable", budget = "5%", max_tokens = 8000 }
+
+[stages.survey]
+mode = "autonomous"
+description = "Map the codebase"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file", "read_files", "list_dir", "context_write", "context_read"]
+max_iterations = 20
+system_prompt = """
+Read every header in include/ and skim src/*.c and the Makefile. Write
+`codebase_map` (context_write): one entry per module with its public API
+(declarations verbatim), what state it owns, who calls it, and which bank it
+lives in (from #pragma code-name or nes.cfg). Note the ROM size headroom
+(`make` output or nes.cfg sizes) and the host-test layout.
+"""
+[stages.survey.tool_routing]
+default_region = "conversation"
+[stages.survey.tool_routing.overrides]
+read_file  = { region = "code", max_result_tokens = 12000 }
+read_files = { region = "code", max_result_tokens = 24000 }
+[stages.survey.transitions.plan]
+hint = "Codebase mapped"
+gate = { require_regions = ["codebase_map"] }
+[stages.survey.transitions.recover]
+condition = "error"
+
+[stages.plan]
+mode = "autonomous"
+description = "Design the feature; get sign-off"
+model = { models = ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna"] }
+available_tools = ["read_file", "context_read", "context_write", "todo_add", "ask_user_confirm"]
+max_iterations = 15
+system_prompt = """
+Design the feature in `task` on top of `codebase_map` without changing any
+behavior described in `behavioral_spec` unless the feature explicitly asks to
+(then the change must be opt-in behind a runtime toggle that defaults to the
+original behavior). Features must work on real NES hardware through cc65:
+respect ROM/RAM headroom, no floats, per-frame budgets.
+
+Write `feature_plan` (context_write): summary, user-facing behavior, touched
+modules with the exact API additions, new data/assets (with sizes), bank
+placement, tests to add, and risks. todo_add one item per touched module.
+Then call ask_user_confirm with a 10-line summary of the plan; if declined,
+revise and ask again.
+"""
+[stages.plan.transitions.implement]
+hint = "Plan approved"
+gate = { require_regions = ["feature_plan"] }
+[stages.plan.transitions.recover]
+condition = "error"
+
+[stages.implement]
+mode = "fan_out"
+description = "Implement the plan, one worker per touched module"
+model = { models = ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna"] }
+worker_agent = "forge-worker"
+merge_stage = "validate"
+max_workers = 4
+on_worker_failure = "continue"
+max_attempts = 3
+split_prompt = """
+Read `feature_plan`, `codebase_map` and the open items in `todos`. Output ONLY a
+JSON array: the very first character of your reply is '[' and the very last
+is ']' — NO markdown code fence (no ```), no "json" label, no prose (a fenced
+reply parses as zero items). One item per open module, each self-contained:
+[{"id": "<module>", "context": {"module", "files": ["src/x.c", "include/x.h", "test/test_x.c"],
+  "plan_excerpt": "<what this module must change, verbatim from feature_plan>",
+  "api": "<current header text plus the planned additions>",
+  "spec_excerpt": "<behavioral_spec entries this module implements, as JSON>",
+  "compile": "cc65 -t nes -O -I include src/<module>.c -o build/<module>.s",
+  "host_test": "gcc -DNES_HOST_TEST -I include test/runner.c test/test_<module>.c src/<module>.c -o build/test_<module> && ./build/test_<module>"}}]
+If nothing is open, output exactly: []
+THIS IS YOUR ONLY TURN AND YOU HAVE NO TOOLS: do not emit an "inspect", "read"
+or "survey" item to gather information first (a run lost its whole worker round
+to one such item) — the regions in this prompt are all the information there
+is; produce the final array of real work items now.
+"""
+
+[stages.validate]
+mode = "autonomous"
+description = "Full build, all tests, original behavior preserved"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file", "read_files", "list_dir", "write_file", "edit_file", "shell", "context_read", "todo_done", "todo_note", "build_check", "build_hosttests", "build_profile", "build_ramlog", "build_observe", "build_oamlog", "build_apu_trace"]
+max_iterations = 30
+max_revisits = 2
+system_prompt = """
+`make clean && make stub-assets && make`, then build_hosttests (strict host
+tests as the user's machine runs them). Fix integration-only
+problems (link errors, header drift). If a module's logic is wrong, todo_note
+it and go back to implement. Confirm every pre-existing test still passes
+(original behavior preserved) and the new feature tests pass. Then confirm
+the original behavior on the real build: build_observe / build_oamlog /
+build_apu_trace at the frames named in the spec's `acceptance_observations`
+and `timelines` must still match (unless the feature intentionally changes
+them — say so in the report). Commit on a
+branch `forge/<feature-slug>` with a descriptive message. Write FEATURE_REPORT.md
+with `## Build` (line `BUILD: OK` and `ROM: build/game.nes`), `## Tests`,
+`## Feature` (how to use it), `## Changes` (files). Then go to publish.
+"""
+[stages.validate.tool_routing]
+default_region = "conversation"
+[stages.validate.tool_routing.overrides]
+shell = { region = "build_output", max_result_tokens = 10000 }
+build_check     = { region = "build_output", max_result_tokens = 3000 }
+build_profile   = { region = "build_output", max_result_tokens = 3000 }
+build_ramlog    = { region = "build_output", max_result_tokens = 3000 }
+build_observe   = { region = "build_output", max_result_tokens = 6000 }
+build_oamlog    = { region = "build_output", max_result_tokens = 5000 }
+build_apu_trace = { region = "build_output", max_result_tokens = 4000 }
+[stages.validate.transitions.implement]
+hint = "A module needs rework"
+transform = "compact"
+[stages.validate.transitions.publish]
+hint = "Build OK, all tests pass, committed"
+gate = { require_no_open_items = "todos" }
+[stages.validate.transitions.recover]
+condition = "error"
+
+[stages.publish]
+mode = "output"
+description = "Hand back the feature report"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["read_file"]
+max_iterations = 3
+[stages.publish.output]
+format = "markdown"
+validator = "validators/report.rhai"
+instructions = "Submit FEATURE_REPORT.md unchanged."
+
+[stages.recover]
+mode = "output"
+description = "Explain what went wrong"
+model = { models = ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"] }
+available_tools = ["context_read"]
+max_iterations = 3
+system_prompt = """
+After submit_output is accepted, do NOTHING else: no more tool calls, no
+further text. One accepted submission ends the run.
+A stage failed or got stuck. Submit a short recovery report as the output:
+which stage, what was being attempted, the last errors, and what a human
+should check.
+"""
+[stages.recover.output]
+format = "markdown"
+instructions = "The recovery report: which stage failed, why, and what to check."

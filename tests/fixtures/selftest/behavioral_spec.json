@@ -1,0 +1,5 @@
+{"game":{"title":"Selftest","mapper_name":"NROM","mapper_number":0,"prg_banks":2,"chr_banks":1,"chr_ram":false,"mirroring":"vertical","bank_classes":[{"bank_class":"fixed","count":2}]},
+ "systems":[{"name":"input_polling","behavior":"Reads controller one each frame using the standard strobe-and-shift protocol and stores the eight button bits.","frequency":"once per frame","inputs":[],"outputs":["controller_1_state"],"constants":[],"state_touched":["controller_1_state"]}],
+ "state_machine":{"states":["boot","hello"],"transitions":[{"from":"boot","to":"hello","trigger":"initialization complete"}]},
+ "ram_variables":[{"name":"controller_1_state","type":"flags","description":"button bits for controller one","size_bytes":1}],
+ "assets":[{"id":"font_tiles","kind":"pattern_table","description":"text font","tile_count":256,"bank_class":"fixed","format":"raw"}]}

@@ -1,0 +1,339 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://leviath.dev/schemas/nes-decomp/asset_manifest.schema.json",
+  "title": "NES Asset Manifest",
+  "description": "Reader-side artifact consumed only by the deterministic extractor. Tells the extractor where each asset lives in the user's ROM and which decoder to apply. This file never enters the writer's context.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "rom_format",
+    "assets"
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "offset": {
+      "type": "string",
+      "pattern": "^0x[0-9A-Fa-f]{1,5}$",
+      "description": "Offset within the bank (hex, 0x-prefixed)."
+    },
+    "format": {
+      "type": "string",
+      "description": "raw | rle | pb53 | lz | script:<path> ; any other name is stored raw"
+    },
+    "asset_base": {
+      "type": "object",
+      "required": [
+        "id",
+        "source",
+        "bank",
+        "offset"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "chr",
+            "prg"
+          ]
+        },
+        "bank": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "offset": {
+          "$ref": "#/$defs/offset"
+        },
+        "format": {
+          "$ref": "#/$defs/format",
+          "default": "raw"
+        },
+        "description": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string",
+          "description": "Output file name relative to the assets directory; defaults to <id> with a kind-specific extension."
+        }
+      }
+    }
+  },
+  "properties": {
+    "rom_format": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mapper",
+        "prg_banks",
+        "chr_rom_banks",
+        "chr_ram"
+      ],
+      "properties": {
+        "mapper": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "submapper": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15
+        },
+        "prg_banks": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "16 KB units."
+        },
+        "chr_rom_banks": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "8 KB units."
+        },
+        "chr_ram": {
+          "type": "boolean"
+        },
+        "mirroring": {
+          "type": "string",
+          "enum": [
+            "horizontal",
+            "vertical",
+            "four_screen"
+          ]
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Digest of the whole .nes file the manifest was produced from."
+        },
+        "prg_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "title": {
+          "type": "string"
+        }
+      }
+    },
+    "assets": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pattern_tables": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/asset_base"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "tile_count"
+                ],
+                "properties": {
+                  "tile_count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 512
+                  },
+                  "byte_count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Encoded size when format is not raw."
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "palettes": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/asset_base"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "count"
+                ],
+                "properties": {
+                  "count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Number of 4-colour palettes (each 4 bytes)."
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "tilemaps": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/asset_base"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "byte_count"
+                ],
+                "properties": {
+                  "byte_count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "layout": {
+                    "type": "string",
+                    "enum": [
+                      "row_major_32x30",
+                      "column_major_30x32",
+                      "metatile_grid",
+                      "custom"
+                    ]
+                  },
+                  "attribute_offset": {
+                    "$ref": "#/$defs/offset"
+                  },
+                  "attribute_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 64
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "audio": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/asset_base"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "byte_count"
+                ],
+                "properties": {
+                  "byte_count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "engine": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "music",
+                      "sfx",
+                      "instruments",
+                      "dmc_sample",
+                      "mixed"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "level_data": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/asset_base"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "byte_count"
+                ],
+                "properties": {
+                  "byte_count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "entries": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "entry_size": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "blobs": {
+          "type": "array",
+          "description": "Anything else the code needs verbatim: text tables, metatile definitions, lookup tables.",
+          "items": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/asset_base"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "byte_count"
+                ],
+                "properties": {
+                  "byte_count": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "kind": {
+                    "type": "string"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "decoders": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "script_path"
+        ],
+        "properties": {
+          "name": {
+            "$ref": "#/$defs/identifier"
+          },
+          "script_path": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_./-]+\\.rhai$"
+          },
+          "description": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
